@@ -4,129 +4,142 @@ import numpy as np
 
 class AbsDiffDetector:
     """
-    AbsDiff-basierte Darterkennung im WARP/Boardspace (z.B. 600x600):
-    - arbeitet auf warped_frame (BGR) + optional gray
-    - nutzt reference_frame (gray)
-    - liefert Kandidaten: tip_board=(x,y), confidence, contour
+    AbsDiff Detector im Boardspace (warped 600x600):
+    - reference_frame = gray reference (clean/last state)
+    - detect(warped_bgr, gray_optional) -> list of objects:
+        {
+          "tip_board": (x,y),
+          "confidence": float,
+          "contour": cnt,
+          "extra": {...}
+        }
     """
 
     def __init__(self, board_mask, freeze_mean=20, freeze_max=70):
         self.board_mask = board_mask
-        self.reference_gray = None
+        self.reference_frame = None  # gray
         self.FREEZE_MEAN = float(freeze_mean)
         self.FREEZE_MAX = float(freeze_max)
 
         # Tuning
-        self.blur = (5, 5)
         self.min_area = 220
-        self.max_area = 14000
-        self.white_ratio_min = 0.00015
-        self.tip_merge_dist = 22
+        self.max_area = 18000
+        self.min_length = 18
+        self.merge_dist = 22
 
-    def set_reference(self, warped_frame_bgr):
-        self.reference_gray = cv2.cvtColor(warped_frame_bgr, cv2.COLOR_BGR2GRAY)
+    def set_reference(self, frame_bgr):
+        self.reference_frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
 
     def detect(self, warped_frame_bgr, gray=None):
-        if self.reference_gray is None:
+        if self.reference_frame is None:
             return [], warped_frame_bgr
 
         if gray is None:
             gray = cv2.cvtColor(warped_frame_bgr, cv2.COLOR_BGR2GRAY)
 
-        h, w = gray.shape[:2]
+        diff = cv2.absdiff(self.reference_frame, gray)
+        h, w = diff.shape[:2]
         board_center = np.array([w / 2.0, h / 2.0], dtype=np.float32)
 
-        diff = cv2.absdiff(self.reference_gray, gray)
-
-        # Smart Motion Freeze (nur falls globales Wackeln, ohne starke lokale Kanten)
-        mean_val = float(cv2.mean(diff)[0])
+        # --- SMART MOTION FREEZE (nur "globales Wackeln" ohne harte lokale Kante) ---
+        mean_val = cv2.mean(diff)[0]
         _, max_val, _, _ = cv2.minMaxLoc(diff)
         if mean_val > self.FREEZE_MEAN and max_val < self.FREEZE_MAX:
             return [], warped_frame_bgr
 
-        diff = cv2.GaussianBlur(diff, self.blur, 0)
+        # Noise / Threshold
+        diff_blur = cv2.GaussianBlur(diff, (5, 5), 0)
+        _, thr = cv2.threshold(diff_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-        # OTSU Threshold
-        _, thr = cv2.threshold(diff, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-        # Morph Close
+        # Morph close
         kernel = np.ones((3, 3), np.uint8)
         thr = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, kernel, iterations=1)
 
-        # Micro-noise Filter
+        # Micro-noise reject
         white_ratio = cv2.countNonZero(thr) / float(w * h)
-        if white_ratio < self.white_ratio_min:
+        if white_ratio < 0.0002:
             return [], warped_frame_bgr
 
-        # Board mask
+        # Apply board mask (Score-relevanter Bereich)
         thr = cv2.bitwise_and(thr, self.board_mask)
 
         contours, _ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         raw = []
-        debug = warped_frame_bgr.copy()
+        dbg = warped_frame_bgr.copy()
 
         for cnt in contours:
             area = float(cv2.contourArea(cnt))
             if area < self.min_area or area > self.max_area:
                 continue
 
-            if len(cnt) < 8:
+            if len(cnt) < 5:
                 continue
 
             pts = cnt.reshape(-1, 2).astype(np.float32)
 
-            # Tip-Strategie:
-            # 1) finde die Punkte, die dem Board-Zentrum am nächsten sind
-            dists = np.linalg.norm(pts - board_center, axis=1)
-            k = max(3, int(0.06 * len(pts)))  # 6% der Punkte (mind. 3)
-            idxs = np.argsort(dists)[:k]
-            tip = pts[idxs].mean(axis=0)
-
-            # Axis/Length für Confidence
             mean, eigenvecs = cv2.PCACompute(pts, mean=None)
+            center = mean[0]  # (x,y)
             axis = eigenvecs[0]
-            proj = np.dot(pts - mean[0], axis)
-            p1 = pts[np.argmin(proj)]
-            p2 = pts[np.argmax(proj)]
+
+            # axis so drehen, dass er Richtung Boardzentrum zeigt
+            if np.dot(axis, (board_center - center)) < 0:
+                axis = -axis
+
+            proj = np.dot(pts - center, axis)  # scalar per point
+            i_min = int(np.argmin(proj))
+            i_max = int(np.argmax(proj))
+
+            p1 = pts[i_min]
+            p2 = pts[i_max]
             length = float(np.linalg.norm(p2 - p1))
-            if length < 12:
+            if length < self.min_length:
                 continue
 
-            width = max(1.0, area / max(length, 1e-6))
+            # "Tip" = Extrempunkt in Richtung Boardzentrum (max projection entlang axis)
+            # statt nur 1 Punkt: Mittelwert der Top-3 (stabiler, weniger Flight-Mitte)
+            idxs = np.argsort(proj)[-3:]
+            tip = np.mean(pts[idxs], axis=0)
+
+            # Zusatzheuristik gegen "Flight/Mitte":
+            # Wenn der Tip weiter vom Zentrum weg ist als das Kontur-Zentrum, dann ist es verdächtig -> skip/penalty
+            tip_dist = float(np.linalg.norm(board_center - tip))
+            center_dist = float(np.linalg.norm(board_center - center))
+            if tip_dist > center_dist + 12:
+                # In der Praxis: Flight/Heck ist oft weiter außen als der Kontur-Schwerpunkt
+                continue
+
+            width = area / max(length, 1.0)
+            width = max(width, 1.0)
             slenderness = length / width
 
-            # Confidence: bevorzugt schlank & lang & genügend Fläche
-            confidence = (length * (slenderness ** 1.15)) * np.log(area + 1.0)
+            confidence = length * slenderness * np.log(area + 1.0)
 
             raw.append({
                 "tip_board": (float(tip[0]), float(tip[1])),
                 "confidence": float(confidence),
                 "contour": cnt,
                 "extra": {
-                    "area": float(area),
-                    "length": float(length),
-                    "slenderness": float(slenderness)
+                    "area": area,
+                    "length": length
                 }
             })
 
-        # Merge (Doppelkonturen)
+        # Merge nahe Tips (Doppelkonturen)
         raw.sort(key=lambda o: o["confidence"], reverse=True)
         merged = []
-        for obj in raw:
+        for o in raw:
             keep = True
             for m in merged:
-                if np.linalg.norm(np.array(obj["tip_board"]) - np.array(m["tip_board"])) < self.tip_merge_dist:
+                if np.linalg.norm(np.array(o["tip_board"]) - np.array(m["tip_board"])) < self.merge_dist:
                     keep = False
-                    if obj["confidence"] > m["confidence"]:
-                        m.update(obj)
                     break
             if keep:
-                merged.append(obj)
+                merged.append(o)
 
-        # Debug zeichnen
-        for obj in merged:
-            cx, cy = obj["tip_board"]
-            cv2.circle(debug, (int(cx), int(cy)), 6, (0, 0, 255), -1)
+        # Debug zeichnen (optional — vision.py nutzt VisionDebugger, aber hier ok)
+        for o in merged[:10]:
+            tx, ty = o["tip_board"]
+            cv2.circle(dbg, (int(tx), int(ty)), 5, (0, 0, 255), -1)
 
-        return merged, debug
+        return merged, dbg
