@@ -2,146 +2,129 @@ import cv2
 import numpy as np
 
 class AbsDiffDetector:
-    def __init__(self, board_mask, freeze_mean=20, freeze_max=70):
+    """
+    Erkennt Dart-Konturen über AbsDiff zur Referenz und bestimmt die Spitze robust:
+    Spitze = Punkt auf Convex Hull mit minimaler Distanz zum Board-Zentrum.
+    Dadurch wird Flight/Tail (weiter weg vom Zentrum) sehr zuverlässig ausgeschlossen.
+    """
+
+    def __init__(self, board_mask, extended_mask=None):
         self.board_mask = board_mask
-        self.reference_frame = None
-        self.FREEZE_MEAN = freeze_mean
-        self.FREEZE_MAX = freeze_max
-        self.board_center = (500, 500)
-        
-        # MODUS-FLAG
-        self.high_sensitivity_mode = False
-        
-        self.radii = {
-            "outer": 450, "double": 420, "triple": 260,
-            "single_bull": 40, "bull": 15
-        }
+        self.extended_mask = extended_mask if extended_mask is not None else board_mask
+        self.reference_gray = None
 
-    def set_reference(self, frame):
-        self.reference_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        # Tuning
+        self.min_area = 220
+        self.max_area = 25000
+        self.min_len = 20
+        self.noise_mean_gate = 1.2  # wenn Diff quasi nix -> skip
+        self.white_ratio_gate = 0.00010  # wenn fast nix weiß -> skip
 
-    def draw_virtual_board(self, img, color=(255, 255, 0)):
-        center = self.board_center
-        for r in [self.radii["outer"], self.radii["double"], self.radii["triple"]]:
-            cv2.circle(img, center, r, color, 1)
-        # ... (Rest der Zeichnung bleibt gleich)
-        cv2.circle(img, center, self.radii["bull"], color, 1)
+    def set_reference(self, frame_bgr):
+        self.reference_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
 
-    def detect(self, warped_frame, gray=None):
-        if self.reference_frame is None:
-            return [], warped_frame
-        
+    def detect(self, frame_bgr, gray=None, center=None):
+        """
+        Returns: (objects, debug_img)
+        object keys:
+          tip: (x,y) float
+          confidence: float
+          contour: cnt
+          method: "absdiff"
+          tip_in_board: bool
+        """
+        if self.reference_gray is None:
+            return [], frame_bgr
+
         if gray is None:
-            gray = cv2.cvtColor(warped_frame, cv2.COLOR_BGR2GRAY)
-            
-        diff = cv2.absdiff(self.reference_frame, gray)
-        
-        # --- 🚀 PARAMETER ---
-        if self.high_sensitivity_mode:
-            thresh_val = 25 # Etwas höher als vorher, um Rauschen zu unterdrücken
-            min_area = 50   # Etwas höher
-        else:
-            thresh_val = 50 
-            min_area = 150 
-        
-        diff_blurred = cv2.GaussianBlur(diff, (5, 5), 0)
-        _, thr = cv2.threshold(diff_blurred, thresh_val, 255, cv2.THRESH_BINARY)
-        thr = cv2.bitwise_and(thr, self.board_mask)
-        
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        thr = cv2.morphologyEx(thr, cv2.MORPH_OPEN, kernel, iterations=1)
-        
+            gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+
+        h, w = gray.shape[:2]
+        if center is None:
+            center = (w / 2.0, h / 2.0)
+        cx, cy = center
+
+        diff = cv2.absdiff(self.reference_gray, gray)
+
+        # Noise gate: wenn nahezu keine Änderung, sofort raus
+        if float(np.mean(diff)) < self.noise_mean_gate:
+            return [], frame_bgr
+
+        # Glätten
+        diff_blur = cv2.GaussianBlur(diff, (5, 5), 0)
+
+        # OTSU Threshold
+        _, thr = cv2.threshold(diff_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # Morph close gegen Löcher
+        kernel = np.ones((3, 3), np.uint8)
+        thr = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+        # Mikro-noise gate (vor Mask!)
+        white_ratio = cv2.countNonZero(thr) / float(w * h)
+        if white_ratio < self.white_ratio_gate:
+            return [], frame_bgr
+
+        # Nur extended Bereich berücksichtigen (Flight darf drin sein)
+        thr = cv2.bitwise_and(thr, self.extended_mask)
+
         contours, _ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        debug_img = warped_frame.copy()
-        self.draw_virtual_board(debug_img, color=(255, 255, 0))
-        
-        raw_objects = []
-        
+
+        debug = frame_bgr.copy()
+        objects = []
+
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if area < min_area: continue
-            
-            # --- PCA FÜR HAUPTACHSE ---
-            if len(cnt) < 5: continue
-            cnt_pts = cnt.reshape(-1, 2).astype(np.float32)
-            mean, eigenvecs = cv2.PCACompute(cnt_pts, mean=None)
-            center = mean[0]
-            main_axis = eigenvecs[0]
-            
-            # --- SPITZE VS FLIGHT UNTERSCHEIDEN ---
-            projected = np.dot(cnt_pts - center, main_axis)
-            min_proj, max_proj = np.min(projected), np.max(projected)
-            
-            # Die Kontur in zwei Hälften teilen (Spitze/Flight)
-            left_half = cnt_pts[np.dot(cnt_pts - center, main_axis) < 0]
-            right_half = cnt_pts[np.dot(cnt_pts - center, main_axis) > 0]
-            
-            if len(left_half) < 2 or len(right_half) < 2: continue
-            
-            # Breite der Hälften messen
-            def get_width(pts):
-                if len(pts) < 2: return 0
-                return np.linalg.norm(np.max(pts, axis=0) - np.min(pts, axis=0))
-            
-            width_left = get_width(left_half)
-            width_right = get_width(right_half)
-            
-            # 🚀 FILTER: Wenn beide Seiten breit sind, ist es kein Pfeil
-            if width_left > 30 and width_right > 30: continue 
+            if area < self.min_area or area > self.max_area:
+                continue
+            if len(cnt) < 5:
+                continue
 
-            # Spitze ist das schmälere Ende
-            if width_left < width_right:
-                actual_tip = center + main_axis * min_proj
-                tip_width = width_left
-            else:
-                actual_tip = center + main_axis * max_proj
-                tip_width = width_right
+            # Hull für stabilere Spitze
+            hull = cv2.convexHull(cnt)
+            hull_pts = hull.reshape(-1, 2).astype(np.float32)
 
-            # --- BEWERTUNG ---
-            dist_to_center = np.linalg.norm(actual_tip - self.board_center)
-            
-            # Sektor Berechnung
-            dx = actual_tip[0] - self.board_center[0]
-            dy = actual_tip[1] - self.board_center[1]
-            angle = np.degrees(np.arctan2(dy, dx))
-            if angle < 0: angle += 360
-            sector_num = int(((angle + 9) % 360) / 18)
-            sector_map = [20, 1, 18, 4, 13, 6, 10, 15, 2, 17, 3, 19, 7, 16, 8, 11, 14, 9, 12, 5]
-            sector = sector_map[sector_num]
-            
-            # Konfidenz: Maß für "Schmalheit" an der Spitze
-            confidence = area * (100 / (tip_width + 1)) 
-            
-            raw_objects.append({
+            # Spitze = Hull-Punkt mit minimaler Distanz zum Zentrum
+            dists = np.linalg.norm(hull_pts - np.array([[cx, cy]], dtype=np.float32), axis=1)
+            tip_idx = int(np.argmin(dists))
+            tip = tuple(hull_pts[tip_idx])
+
+            # Tail = Hull-Punkt mit maximaler Distanz zum Zentrum (für Länge)
+            tail_idx = int(np.argmax(dists))
+            tail = tuple(hull_pts[tail_idx])
+
+            length = float(np.linalg.norm(np.array(tip) - np.array(tail)))
+            if length < self.min_len:
+                continue
+
+            # Breite grob über area/length
+            width = max(area / max(length, 1.0), 1.0)
+
+            # Confidence: lang + schlank + größer = besser
+            slenderness = length / width
+            confidence = (length * slenderness) * np.log(area + 1.0)
+
+            # Bonus wenn Tip näher am Boardzentrum liegt (typisch echte Spitze)
+            tip_dist = float(np.linalg.norm(np.array(tip) - np.array([cx, cy])))
+            confidence *= 1.0 / (1.0 + (tip_dist / 200.0))
+
+            tip_in_board = False
+            tx, ty = int(round(tip[0])), int(round(tip[1]))
+            if 0 <= tx < w and 0 <= ty < h:
+                tip_in_board = (self.board_mask[ty, tx] > 0)
+
+            objects.append({
+                "tip": tip,
+                "confidence": float(confidence),
+                "area": float(area),
                 "contour": cnt,
-                "area": area,
-                "confidence": confidence,
-                "tip": tuple(actual_tip.astype(int)),
-                "sector": sector,
-                "is_missed": dist_to_center > self.radii["outer"]
+                "method": "absdiff",
+                "tip_in_board": bool(tip_in_board),
             })
-            
-        # Merging
-        merged_objects = []
-        for obj in raw_objects:
-            merged = False
-            for m in merged_objects:
-                if np.linalg.norm(np.array(obj["tip"]) - np.array(m["tip"])) < 50:
-                    if obj["confidence"] > m["confidence"]:
-                        m.update(obj)
-                    merged = True
-                    break
-            if not merged:
-                merged_objects.append(obj)
-        
-        # --- Debug Visualisierung ---
-        for obj in merged_objects:
-            contour_color = (0, 0, 255) # Rot für erkannt
-            cv2.drawContours(debug_img, [obj["contour"]], 0, contour_color, 2)
-            cv2.circle(debug_img, obj["tip"], 7, (0, 0, 255), -1)
-            text = f"{obj['sector']} (Conf:{int(obj['confidence'])})"
-            cv2.putText(debug_img, text, (obj["tip"][0]+15, obj["tip"][1]), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            
-        return merged_objects, debug_img
+
+            # Debug
+            cv2.drawContours(debug, [cnt], -1, (0, 255, 0), 1)
+            cv2.circle(debug, (int(tip[0]), int(tip[1])), 6, (0, 0, 255), -1)
+            cv2.circle(debug, (int(tail[0]), int(tail[1])), 6, (255, 0, 0), 1)
+
+        return objects, debug
