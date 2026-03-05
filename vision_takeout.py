@@ -4,57 +4,55 @@ import numpy as np
 
 class TakeoutDetector:
     """
-    Erkennt, ob Darts entfernt wurden (Board wieder "leer"):
-    - Referenz: clean_board (warped gray)
-    - Vergleich: absdiff + threshold
-    - Optional: wenn last_hit_contours vorhanden, reicht es, im Board generell Diff zu sehen
-      (kann später per ROI um Konturen herum verfeinert werden)
+    Takeout-Erkennung im Boardspace (warped):
+    - clean_board = graues Referenzbild "Board ohne Pfeile"
+    - check_takeout(warped_bgr, last_hit_contours) -> (is_empty, debug_img)
+      is_empty=True  => Board ist sauber/leer (Takeout passiert)
+      is_empty=False => es steckt noch was / Bewegung im Boardbereich
     """
 
     def __init__(self, board_mask):
         self.board_mask = board_mask
-        self.clean_board = None  # gray warped
+        self.clean_board = None  # gray
 
         # Tuning
-        self.thr_val = 40
-        self.min_area = 300
-        self.global_nonzero_limit = 1200
+        self.thr = 40
+        self.min_nonzero = 1000
+        self.min_cnt_area = 300
 
-    def set_clean_board(self, warped_bgr):
-        self.clean_board = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2GRAY)
+    def set_clean_board(self, frame_bgr):
+        self.clean_board = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
 
-    def check_takeout(self, warped_bgr, last_hit_contours):
+    def check_takeout(self, warped_frame_bgr, last_hit_contours):
         if self.clean_board is None:
-            return False, warped_bgr
+            return False, warped_frame_bgr
 
-        gray = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(warped_frame_bgr, cv2.COLOR_BGR2GRAY)
 
         diff = cv2.absdiff(self.clean_board, gray)
         diff = cv2.GaussianBlur(diff, (5, 5), 0)
 
-        _, thr = cv2.threshold(diff, self.thr_val, 255, cv2.THRESH_BINARY)
+        _, thr = cv2.threshold(diff, self.thr, 255, cv2.THRESH_BINARY)
         thr = cv2.bitwise_and(thr, self.board_mask)
 
-        debug = warped_bgr.copy()
+        debug_img = warped_frame_bgr.copy()
 
-        contours, _ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        # Standard: "leer" = keine ausreichende Veränderung mehr sichtbar
-        still_something = False
+        # Default: leer (true) – und wir widerlegen es bei Befund
+        is_empty = True
 
         if last_hit_contours:
-            # Sobald irgendein signifikanter Bereich noch Differenz hat, gilt: noch nicht leer
+            contours, _ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             for cnt in contours:
-                if cv2.contourArea(cnt) > self.min_area:
-                    still_something = True
+                if cv2.contourArea(cnt) > self.min_cnt_area:
+                    is_empty = False
                     break
+
+            if not is_empty:
+                cv2.drawContours(debug_img, contours, -1, (0, 0, 255), 1)
+
         else:
-            # Wenn eigentlich keine Darts stecken sollten, aber trotzdem viel Diff: nicht leer
-            if cv2.countNonZero(thr) > self.global_nonzero_limit:
-                still_something = True
+            # Wenn "eigentlich leer", sollte im Threshold kaum was sein
+            if cv2.countNonZero(thr) > self.min_nonzero:
+                is_empty = False
 
-        if still_something:
-            cv2.drawContours(debug, contours, -1, (0, 0, 255), 1)
-
-        takeout_detected = not still_something
-        return takeout_detected, debug
+        return is_empty, debug_img
