@@ -4,10 +4,10 @@ import json
 import os
 import sys
 import time
+import configparser
 
 from vision_absdiff import AbsDiffDetector
 from vision_takeout import TakeoutDetector
-
 
 def get_external_path(filename):
     if getattr(sys, 'frozen', False):
@@ -16,114 +16,106 @@ def get_external_path(filename):
         base_path = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_path, filename)
 
+def read_debug_ini():
+    ini_path = get_external_path("vision_debug.ini")
+    cfg = configparser.ConfigParser()
+    debugging = 0
+    warp_size = 800
+    if os.path.exists(ini_path):
+        cfg.read(ini_path, encoding="utf-8")
+        debugging = int(cfg.get("vision", "debugging", fallback="0").strip())
+        warp_size = int(cfg.get("vision", "warp_size", fallback="800").strip())
+    return debugging == 1, warp_size
+
+def load_points(path):
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        pts = data.get("points", None)
+        if not pts or len(pts) != 4:
+            return None
+        return np.float32(pts)
+    except:
+        return None
 
 class CameraHandler:
-    def __init__(self, cam_id, canvas_size=800, nutzungs_faktor=0.70):
+    def __init__(self, cam_id):
         self.cam_id = cam_id
-        self.canvas_size = int(canvas_size)
-        self.nutzungs_faktor = float(nutzungs_faktor)
-
         self.config_file = get_external_path(f"cam{cam_id}_config.json")
-        self.src_points = []
-        self.load_config()
+        self.src_points = load_points(self.config_file)
 
         self.cap = cv2.VideoCapture(cam_id, cv2.CAP_DSHOW)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-        time.sleep(1.5)
+        time.sleep(1.2)
         self.cap.set(cv2.CAP_PROP_FPS, 30)
 
-        # Exposure
-        self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)  # manual
+        # deine Exposure-Fixes
+        self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
         self.cap.set(cv2.CAP_PROP_EXPOSURE, -7)
         self.cap.set(cv2.CAP_PROP_GAIN, 10)
-        if self.cam_id == 2:
-            self.cap.set(cv2.CAP_PROP_BRIGHTNESS, 100)
-        else:
-            self.cap.set(cv2.CAP_PROP_BRIGHTNESS, 150)
+        self.cap.set(cv2.CAP_PROP_BRIGHTNESS, 100 if cam_id == 2 else 150)
 
-        self.matrix = None
-        self.compute_warp_matrix()
+        self.H = None      # cam -> board(600)
+        self.Hinv = None
+        self.board_center_full = None
 
-        # Motion reference
-        self.reference_gray = None
+        self.compute_homography()
 
-    def load_config(self):
-        if os.path.exists(self.config_file):
-            try:
-                with open(self.config_file, "r") as f:
-                    data = json.load(f)
-                    self.src_points = data.get("points", [])
-            except Exception:
-                print(f"[ERROR] Config für Cam {self.cam_id} konnte nicht geladen werden.")
-                self.src_points = []
-
-    def compute_warp_matrix(self):
-        if len(self.src_points) < 4:
+    def compute_homography(self):
+        if self.src_points is None:
+            self.H = None
+            self.Hinv = None
+            self.board_center_full = None
             return
 
-        pts1 = np.float32(self.src_points)
+        # Board-space (600x600) Referenzpunkte (wie bisher, 9° Rotation)
+        canvas = 600
+        c = canvas / 2
+        f = 0.70
+        r = (canvas / 2) * f
+        cos9, sin9 = 0.987, 0.156
 
-        canvas = self.canvas_size
-        c = canvas / 2.0
-        dist = (canvas / 2.0) * self.nutzungs_faktor
+        dst = np.float32([
+            [c + r * sin9, c - r * cos9],  # top
+            [c + r * cos9, c + r * sin9],  # right
+            [c - r * sin9, c + r * cos9],  # bottom
+            [c - r * cos9, c - r * sin9],  # left
+        ])
 
-        # Rotation 9°: cos=0.987, sin=0.156
-        sin9, cos9 = 0.156, 0.987
+        self.H = cv2.getPerspectiveTransform(self.src_points, dst)
+        self.Hinv = np.linalg.inv(self.H)
 
-        top =  (c + dist * sin9, c - dist * cos9)
-        right = (c + dist * cos9, c + dist * sin9)
-        bot =  (c - dist * sin9, c + dist * cos9)
-        left = (c - dist * cos9, c - dist * sin9)
+        # Boardzentrum in Full-Frame schätzen (für Tip-Richtung)
+        pt = np.array([[[300.0, 300.0]]], dtype=np.float32)
+        center_full = cv2.perspectiveTransform(pt, self.Hinv)[0][0]
+        self.board_center_full = (float(center_full[0]), float(center_full[1]))
 
-        pts2 = np.float32([top, right, bot, left])
-        self.matrix = cv2.getPerspectiveTransform(pts1, pts2)
-
-    def get_warped(self, frame):
-        if self.matrix is None or frame is None:
-            return None
-        return cv2.warpPerspective(frame, self.matrix, (self.canvas_size, self.canvas_size))
-
-    def release(self):
-        try:
-            self.cap.release()
-        except Exception:
-            pass
-
+    def read(self):
+        return self.cap.read()
 
 class DartVisionSystem:
     def __init__(self, hit_callback):
         self.hit_callback = hit_callback
+        self.running = True
 
-        # --- Bild & Masken ---
-        self.canvas_size = 800
-        self.center = (self.canvas_size / 2.0, self.canvas_size / 2.0)
+        self.debug_enabled, warp_size = read_debug_ini()
+        self.debugger = None
+        if self.debug_enabled:
+            from vision_debug import VisionDebugger
+            self.debugger = VisionDebugger(warp_size=warp_size)
 
-        # Board-Skalierung (wie bei dir, nur canvas angepasst)
+        self.cameras = [CameraHandler(i) for i in range(3)]
+
+        # Board mask + radii (board space)
+        self.canvas = 600
+        self.center = np.array([300.0, 300.0], dtype=np.float32)
+
         total_radius_mm = 170.0 + 55.0
-        self.nutzungs_faktor = 0.70
-        self.px_per_mm = (self.canvas_size * self.nutzungs_faktor) / (total_radius_mm * 2.0)
+        self.px_per_mm = (self.canvas * 0.70) / (total_radius_mm * 2)
 
-        # Board-Maske: bis Double-Outer
-        self.board_mask = np.zeros((self.canvas_size, self.canvas_size), dtype=np.uint8)
-        r_double_outer = int(round(170.0 * self.px_per_mm))
-        cv2.circle(self.board_mask, (int(self.center[0]), int(self.center[1])), r_double_outer, 255, -1)
-
-        # Extended Maske: größer, damit Flights / Überstand fürs Event drin sind
-        self.extended_mask = np.zeros((self.canvas_size, self.canvas_size), dtype=np.uint8)
-        extra_mm = 120.0  # ggf. 80..140 tunen
-        r_ext = int(round((170.0 + extra_mm) * self.px_per_mm))
-        r_ext = min(r_ext, int(self.center[0]) - 2)
-        cv2.circle(self.extended_mask, (int(self.center[0]), int(self.center[1])), r_ext, 255, -1)
-
-        # --- Kameras ---
-        self.cameras = [CameraHandler(i, canvas_size=self.canvas_size, nutzungs_faktor=self.nutzungs_faktor) for i in range(3)]
-
-        # --- Detektoren ---
-        self.detectors = [AbsDiffDetector(self.board_mask, self.extended_mask) for _ in range(3)]
-        self.takeout_detectors = [TakeoutDetector(self.board_mask, self.extended_mask) for _ in range(3)]
-
-        # Scoring-Radien
         self.radii = {
             "bull": 6.35 * self.px_per_mm,
             "single_bull": 15.9 * self.px_per_mm,
@@ -133,87 +125,50 @@ class DartVisionSystem:
             "double_outer": 170.0 * self.px_per_mm
         }
 
+        self.board_mask = np.zeros((600, 600), dtype=np.uint8)
+        cv2.circle(self.board_mask, (300, 300), int(self.radii["double_outer"]), 255, -1)
+
+        # Modules
+        self.absdet = [AbsDiffDetector() for _ in range(3)]
+        self.takeout = [TakeoutDetector(self.board_mask) for _ in range(3)]
+
+        # State
+        self.last_hit_time = 0.0
+        self.last_hit_board = None  # (bx,by) für Duplicate-Filter
+        self.hit_candidate = None
+        self.hit_candidate_time = 0.0
+
         self.WINKEL_OFFSET = 0
 
-        # --- State ---
-        self.running = True
-        self.last_hit_time = 0.0
-        self.cooldown_s = 0.25
+        self.set_references()
 
-        self.last_hit_coords = None  # (x,y) final
-        self.has_dart_in_board = False
-
-        # Temporal verification (2-Frame confirm)
-        self.candidate = None
-        self.candidate_time = 0.0
-        self.confirm_dist_px = 18
-        self.confirm_time_s = 0.25
-
-        # Motion freeze (gegen Board-Schwingen)
-        self.freeze_mean = 16.0
-        self.freeze_max = 70.0
-
-        # Event gate
-        self.event_pixel_threshold = 450  # je nach Licht 250..900
-
-    def reset_references(self):
+    def set_references(self):
         for i, cam in enumerate(self.cameras):
-            cam.load_config()
-            cam.compute_warp_matrix()
-            if cam.matrix is None:
-                continue
-
-            for _ in range(10):
-                cam.cap.read()
-
-            ret, frame = cam.cap.read()
-            if not ret:
-                continue
-
-            warped = cam.get_warped(frame)
-            if warped is None:
-                continue
-
-            gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-            cam.reference_gray = gray.copy()
-
-            self.detectors[i].set_reference(warped)
-            self.takeout_detectors[i].set_clean_board(warped)
-
-        self.candidate = None
-        self.has_dart_in_board = False
-        self.last_hit_coords = None
-
-    def update_references(self):
-        # nach Treffer: neue Referenz, damit AbsDiff nicht “dauernd Dart” sieht
-        for i, cam in enumerate(self.cameras):
+            # buffer leeren
             for _ in range(5):
                 cam.cap.read()
-            ret, frame = cam.cap.read()
-            if not ret:
+            ret, frame = cam.read()
+            if not ret or frame is None:
                 continue
-            warped = cam.get_warped(frame)
-            if warped is None:
-                continue
-            gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-            cam.reference_gray = gray.copy()
-            self.detectors[i].set_reference(warped)
+            self.absdet[i].set_reference(frame)
+            self.takeout[i].set_clean_board(frame)
 
-    def is_board_moving(self, gray, cam_ref_gray):
-        if cam_ref_gray is None:
-            return False
-        diff = cv2.absdiff(gray, cam_ref_gray)
-        mean_val = cv2.mean(diff)[0]
-        _, max_val, _, _ = cv2.minMaxLoc(diff)
-        return (mean_val > self.freeze_mean and max_val < self.freeze_max)
+    def full_to_board(self, cam, x, y):
+        if cam.H is None:
+            return None
+        pt = np.array([[[float(x), float(y)]]], dtype=np.float32)
+        b = cv2.perspectiveTransform(pt, cam.H)[0][0]
+        return float(b[0]), float(b[1])
 
-    def get_score(self, x, y):
-        cx, cy = self.center
-        rel_x, rel_y = x - cx, y - cy
-        dist = float(np.linalg.norm([rel_x, rel_y]))
-        angle = (np.degrees(np.arctan2(-rel_y, rel_x)) + 360.0) % 360.0
-        angle = (angle + self.WINKEL_OFFSET) % 360.0
+    def is_missed(self, bx, by):
+        d = float(np.linalg.norm(np.array([bx, by], dtype=np.float32) - self.center))
+        return d > float(self.radii["double_outer"])
 
+    def get_score(self, bx, by):
+        rel = np.array([bx, by], dtype=np.float32) - self.center
+        dist = float(np.linalg.norm(rel))
+        angle = (np.degrees(np.arctan2(-rel[1], rel[0])) + 360) % 360
+        angle = (angle + self.WINKEL_OFFSET) % 360
         segments = [6, 13, 4, 18, 1, 20, 5, 12, 9, 14, 11, 8, 16, 7, 19, 3, 17, 2, 15, 10]
         val = segments[int((angle + 9) / 18) % 20]
 
@@ -229,160 +184,121 @@ class DartVisionSystem:
             return (val, 1)
         return (0, 0)
 
-    def point_in_board(self, x, y):
-        ix, iy = int(round(x)), int(round(y))
-        if ix < 0 or iy < 0 or ix >= self.canvas_size or iy >= self.canvas_size:
-            return False
-        return self.board_mask[iy, ix] > 0
+    def fuse_points(self, board_points_conf):
+        """
+        board_points_conf: list of (bx,by,conf, cam_id, tip_full)
+        -> weighted average of top 3
+        """
+        if len(board_points_conf) < 2:
+            return None
+
+        board_points_conf.sort(key=lambda t: t[2], reverse=True)
+        top = board_points_conf[:3]
+
+        weights = np.array([max(1.0, min(t[2], 1e6)) for t in top], dtype=np.float32)
+        xs = np.array([t[0] for t in top], dtype=np.float32)
+        ys = np.array([t[1] for t in top], dtype=np.float32)
+
+        bx = float(np.average(xs, weights=weights))
+        by = float(np.average(ys, weights=weights))
+        return bx, by
 
     def run(self):
-        print("[VISION] System bereit (NEU)...")
-        try:
-            self.reset_references()
+        while self.running:
+            board_points_conf = []
+            takeout_votes = 0
 
-            while self.running:
-                debug_frames = {}
-                valid = []  # (cam_id, tip(x,y), conf, tip_in_board)
-
-                # Takeout: leer?
-                empties = 0
-                moving_any = False
-
-                for i, cam in enumerate(self.cameras):
-                    ret, frame = cam.cap.read()
-                    if not ret:
-                        continue
-
-                    warped = cam.get_warped(frame)
-                    if warped is None:
-                        continue
-
-                    gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-
-                    # Motion freeze pro Cam
-                    if self.is_board_moving(gray, cam.reference_gray):
-                        moving_any = True
-                        # trotzdem Takeout nicht entscheiden, aber debug zeigen
-                        empty_now, tdbg = self.takeout_detectors[i].is_empty(warped, gray)
-                        debug_frames[cam.cam_id] = tdbg
-                        continue
-
-                    # Takeout check
-                    empty_now, tdbg = self.takeout_detectors[i].is_empty(warped, gray)
-                    if empty_now:
-                        empties += 1
-
-                    # AbsDiff candidates
-                    objs, dbg = self.detectors[i].detect(warped, gray=gray, center=self.center)
-
-                    # Event gate (optional, hilft gegen random noise):
-                    # Wenn keinerlei diff im extended ROI, dann skip candidates.
-                    # (Wir nutzen detector schon; hier könnte man zusätzlich thr count nutzen,
-                    # aber AbsDiffDetector macht bereits gates.)
-                    if objs:
-                        best = max(objs, key=lambda o: o["confidence"])
-                        tip = best["tip"]
-                        conf = float(best["confidence"])
-                        valid.append((cam.cam_id, tip, conf, bool(best["tip_in_board"])))
-                        cv2.circle(tdbg, (int(tip[0]), int(tip[1])), 8, (0, 0, 255), -1)
-
-                    debug_frames[cam.cam_id] = tdbg
-
-                # Wenn Board bewegt sich: keine Entscheidungen, Candidate reset
-                if moving_any:
-                    self.candidate = None
-                    cv2.waitKey(1)
-                    for cid, img in debug_frames.items():
-                        cv2.imshow(f"Cam {cid} Debug", img)
-                    time.sleep(0.01)
+            # 1) pro Cam lesen + AbsDiff Tip finden + optional Debug anzeigen
+            for i, cam in enumerate(self.cameras):
+                ret, frame = cam.read()
+                if not ret or frame is None or cam.H is None:
                     continue
 
-                # --- TAKEOUT LOGIK ---
-                # Wenn Dart vorher da war und jetzt alle 3 "empty": Next player
-                if self.last_hit_coords is not None and empties >= 3:
-                    print("[VISION] Takeout: alle Cams leer -> NEXT_PLAYER")
-                    self.last_hit_coords = None
-                    self.has_dart_in_board = False
-                    self.candidate = None
-                    self.reset_references()
-                    self.hit_callback("NEXT_PLAYER")
+                tips = self.absdet[i].detect(frame, board_center_full=cam.board_center_full)
+                if tips:
+                    best = tips[0]
+                    tip_full = best["tip"]
 
-                # --- HIT / MISSED LOGIK ---
-                # Wir verarbeiten nur, wenn mindestens 2 Cams etwas sehen
-                if len(valid) >= 2 and (time.time() - self.last_hit_time) > self.cooldown_s:
-                    # sort by confidence
-                    valid.sort(key=lambda x: x[2], reverse=True)
+                    tip_board = self.full_to_board(cam, tip_full[0], tip_full[1])
+                    if tip_board is not None:
+                        bx, by = tip_board
+                        board_points_conf.append((bx, by, best["confidence"], cam.cam_id, tip_full))
 
-                    top = valid[:3]
-                    weights = [min(v[2], 1e6) for v in top]
-                    points = [v[1] for v in top]
+                    if self.debugger:
+                        self.debugger.show(cam.cam_id, frame, cam.H, tip_full=tip_full, tip_board=tip_board)
+                else:
+                    if self.debugger:
+                        self.debugger.show(cam.cam_id, frame, cam.H, tip_full=None, tip_board=None)
 
-                    fx = float(np.average([p[0] for p in points], weights=weights))
-                    fy = float(np.average([p[1] for p in points], weights=weights))
+                # Takeout nur sinnvoll, wenn vorher ein Dart erkannt wurde
+                if self.last_hit_board is not None:
+                    if self.takeout[i].check_takeout(frame, cam.H):
+                        takeout_votes += 1
 
-                    # Plausibility: beste 2 dürfen nicht zu weit auseinander liegen
-                    d12 = float(np.linalg.norm(np.array(valid[0][1]) - np.array(valid[1][1])))
-                    if d12 < 85:
-                        current = (fx, fy)
+            # 2) Takeout-Event (2/3 Kameras reichen)
+            if self.last_hit_board is not None and takeout_votes >= 2:
+                self.last_hit_board = None
+                self.hit_candidate = None
+                self.set_references()
+                self.hit_callback("NEXT_PLAYER")
+                time.sleep(0.05)
+                continue
 
-                        # Temporal confirm (2 Frames)
-                        if self.candidate is None:
-                            self.candidate = current
-                            self.candidate_time = time.time()
-                        else:
-                            dist_prev = float(np.linalg.norm(np.array(current) - np.array(self.candidate)))
-                            dt = time.time() - self.candidate_time
+            # 3) Hit-Fusion + Temporal Confirm + Duplicate Filter
+            fused = self.fuse_points(board_points_conf)
+            if fused is None:
+                time.sleep(0.005)
+                continue
 
-                            if dist_prev < self.confirm_dist_px and dt < self.confirm_time_s:
-                                # CONFIRMED
-                                in_board = self.point_in_board(fx, fy)
+            bx, by = fused
+            now = time.time()
 
-                                if in_board:
-                                    sec, mult = self.get_score(fx, fy)
-                                    if (sec, mult) != (0, 0):
-                                        payload = {"sector": int(sec), "is_missed": False, "x": float(fx), "y": float(fy)}
-                                        print(f"[VISION] HIT sector={sec} at {fx:.1f},{fy:.1f}")
-                                        self.hit_callback(payload)
+            # Temporal verification
+            if self.hit_candidate is None:
+                self.hit_candidate = (bx, by)
+                self.hit_candidate_time = now
+                continue
 
-                                        self.last_hit_coords = (fx, fy)
-                                        self.has_dart_in_board = True
-                                        self.last_hit_time = time.time()
+            dist_prev = float(np.linalg.norm(np.array([bx, by]) - np.array(self.hit_candidate)))
+            if dist_prev > 18 or (now - self.hit_candidate_time) > 0.25:
+                self.hit_candidate = (bx, by)
+                self.hit_candidate_time = now
+                continue
 
-                                        time.sleep(0.25)  # kurze Stabilisierung
-                                        self.update_references()
+            # Debounce
+            if now - self.last_hit_time < 0.25:
+                continue
 
-                                else:
-                                    # Throw erkannt, aber außerhalb Board -> MISSED
-                                    payload = {"sector": 0, "is_missed": True, "x": float(fx), "y": float(fy)}
-                                    print(f"[VISION] MISSED at {fx:.1f},{fy:.1f}")
-                                    self.hit_callback(payload)
+            # Duplicate protection
+            if self.last_hit_board is not None:
+                old_dist = float(np.linalg.norm(np.array([bx, by]) - np.array(self.last_hit_board)))
+                if old_dist < 18:
+                    continue
 
-                                    self.last_hit_coords = (fx, fy)  # merken, damit Takeout überhaupt Sinn macht
-                                    self.has_dart_in_board = False
-                                    self.last_hit_time = time.time()
+            # 4) Missed vs Score an main.py
+            if self.is_missed(bx, by):
+                payload = {"is_missed": True, "sector": 0, "board_x": bx, "board_y": by}
+            else:
+                sector, mult = self.get_score(bx, by)
+                payload = {"is_missed": False, "sector": sector, "multiplier": mult, "board_x": bx, "board_y": by}
 
-                                    time.sleep(0.15)
-                                    self.update_references()
+            self.hit_callback(payload)
 
-                                self.candidate = None
-                            else:
-                                # reset candidate
-                                self.candidate = current
-                                self.candidate_time = time.time()
-                    else:
-                        # zu weit auseinander -> kein event
-                        self.candidate = None
+            # 5) State update + references
+            self.last_hit_board = (bx, by)
+            self.last_hit_time = now
+            self.hit_candidate = None
 
-                # Debug anzeigen
-                for cid, img in debug_frames.items():
-                    cv2.imshow(f"Cam {cid} Debug", img)
-                cv2.waitKey(1)
-
-        except Exception as e:
-            print(f"[ERROR] Vision run crashed: {e}")
+            # kurze Settle-time, dann reference aktualisieren
+            time.sleep(0.25)
+            self.set_references()
 
     def stop(self):
         self.running = False
         for cam in self.cameras:
-            cam.release()
-        cv2.destroyAllWindows()
+            try:
+                cam.cap.release()
+            except:
+                pass
+        if self.debugger:
+            self.debugger.close()
