@@ -8,6 +8,8 @@ import configparser
 
 from vision_absdiff import AbsDiffDetector
 from vision_takeout import TakeoutDetector
+from vision_vector import VectorDetector
+
 
 def get_external_path(filename):
     if getattr(sys, 'frozen', False):
@@ -15,6 +17,7 @@ def get_external_path(filename):
     else:
         base_path = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_path, filename)
+
 
 def read_debug_ini():
     ini_path = get_external_path("vision_debug.ini")
@@ -26,6 +29,7 @@ def read_debug_ini():
         debugging = int(cfg.get("vision", "debugging", fallback="0").strip())
         warp_size = int(cfg.get("vision", "warp_size", fallback="800").strip())
     return debugging == 1, warp_size
+
 
 def load_points(path):
     if not os.path.exists(path):
@@ -39,6 +43,7 @@ def load_points(path):
         return np.float32(pts)
     except:
         return None
+
 
 class CameraHandler:
     def __init__(self, cam_id):
@@ -59,8 +64,9 @@ class CameraHandler:
         self.cap.set(cv2.CAP_PROP_BRIGHTNESS, 100 if cam_id == 2 else 150)
 
         self.H = None      # cam -> board(600)
-        self.Hinv = None
+        self.Hinv = None   # board -> cam (Full)
         self.board_center_full = None
+        self.board_roi_mask_full = None  # Maske im Fullframe (für VectorDetector)
 
         self.compute_homography()
 
@@ -69,9 +75,10 @@ class CameraHandler:
             self.H = None
             self.Hinv = None
             self.board_center_full = None
+            self.board_roi_mask_full = None
             return
 
-        # Board-space (600x600) Referenzpunkte (wie bisher, 9° Rotation)
+        # Board-space (600x600) Referenzpunkte (Rotation 9°)
         canvas = 600
         c = canvas / 2
         f = 0.70
@@ -88,13 +95,21 @@ class CameraHandler:
         self.H = cv2.getPerspectiveTransform(self.src_points, dst)
         self.Hinv = np.linalg.inv(self.H)
 
-        # Boardzentrum in Full-Frame schätzen (für Tip-Richtung)
+        # Boardzentrum in Full-Frame
         pt = np.array([[[300.0, 300.0]]], dtype=np.float32)
         center_full = cv2.perspectiveTransform(pt, self.Hinv)[0][0]
         self.board_center_full = (float(center_full[0]), float(center_full[1]))
 
+        # ROI Maske im Fullframe (für VectorDetector, ohne hart zu croppen)
+        # Wir nehmen den Board-Kreis (double_outer) im Boardspace und warpen ihn zurück.
+        board_mask_600 = np.zeros((600, 600), dtype=np.uint8)
+        cv2.circle(board_mask_600, (300, 300), 300, 255, -1)  # grob (wird in DartVisionSystem verfeinert)
+        full_h, full_w = 1080, 1920
+        self.board_roi_mask_full = cv2.warpPerspective(board_mask_600, self.Hinv, (full_w, full_h))
+
     def read(self):
         return self.cap.read()
+
 
 class DartVisionSystem:
     def __init__(self, hit_callback):
@@ -130,11 +145,12 @@ class DartVisionSystem:
 
         # Modules
         self.absdet = [AbsDiffDetector() for _ in range(3)]
+        self.vecdet = [VectorDetector() for _ in range(3)]
         self.takeout = [TakeoutDetector(self.board_mask) for _ in range(3)]
 
         # State
         self.last_hit_time = 0.0
-        self.last_hit_board = None  # (bx,by) für Duplicate-Filter
+        self.last_hit_board = None  # (bx,by)
         self.hit_candidate = None
         self.hit_candidate_time = 0.0
 
@@ -144,7 +160,6 @@ class DartVisionSystem:
 
     def set_references(self):
         for i, cam in enumerate(self.cameras):
-            # buffer leeren
             for _ in range(5):
                 cam.cap.read()
             ret, frame = cam.read()
@@ -184,58 +199,121 @@ class DartVisionSystem:
             return (val, 1)
         return (0, 0)
 
-    def fuse_points(self, board_points_conf):
+    def pick_best_per_cam(self, abs_candidates, vec_candidates):
         """
-        board_points_conf: list of (bx,by,conf, cam_id, tip_full)
-        -> weighted average of top 3
+        Kandidaten aus beiden Methoden zusammenführen.
+        Wir normalisieren leicht, weil AbsDiff-Confidence anders skaliert als Vector.
         """
-        if len(board_points_conf) < 2:
+        best = None
+
+        # AbsDiff hat oft große Werte -> etwas dämpfen
+        for c in abs_candidates[:3]:
+            conf = float(c["confidence"]) * 1.0
+            if best is None or conf > best["confidence"]:
+                best = {"tip": c["tip"], "confidence": conf, "src": "abs", "extra": c}
+
+        # Vector Confidence ist eher klein -> etwas boosten
+        for c in vec_candidates[:3]:
+            conf = float(c["confidence"]) * 2.0
+            if best is None or conf > best["confidence"]:
+                best = {"tip": c["tip"], "confidence": conf, "src": "vec", "extra": c}
+
+        return best
+
+    def fuse_multicam_robust(self, per_cam_estimates, cluster_dist=60.0):
+        """
+        per_cam_estimates: list of dict:
+            { cam_id, bx, by, confidence, tip_full, src }
+        Ziel:
+          - Ausreißer wegwerfen
+          - Beste Clustergruppe (z.B. 2/3) wählen
+          - Weighted average daraus
+        """
+        if len(per_cam_estimates) < 2:
             return None
 
-        board_points_conf.sort(key=lambda t: t[2], reverse=True)
-        top = board_points_conf[:3]
+        pts = np.array([[e["bx"], e["by"]] for e in per_cam_estimates], dtype=np.float32)
 
-        weights = np.array([max(1.0, min(t[2], 1e6)) for t in top], dtype=np.float32)
-        xs = np.array([t[0] for t in top], dtype=np.float32)
-        ys = np.array([t[1] for t in top], dtype=np.float32)
+        # Clusterbildung: für jeden Punkt, sammle Nachbarn innerhalb cluster_dist
+        best_cluster_idx = None
+        best_cluster_size = 0
+
+        for i in range(len(pts)):
+            dists = np.linalg.norm(pts - pts[i], axis=1)
+            cluster = np.where(dists <= cluster_dist)[0]
+            if len(cluster) > best_cluster_size:
+                best_cluster_size = len(cluster)
+                best_cluster_idx = cluster
+
+        if best_cluster_idx is None or best_cluster_size < 2:
+            return None
+
+        cluster_est = [per_cam_estimates[i] for i in best_cluster_idx]
+
+        # Weighted average
+        weights = np.array([max(1.0, min(e["confidence"], 1e6)) for e in cluster_est], dtype=np.float32)
+        xs = np.array([e["bx"] for e in cluster_est], dtype=np.float32)
+        ys = np.array([e["by"] for e in cluster_est], dtype=np.float32)
 
         bx = float(np.average(xs, weights=weights))
         by = float(np.average(ys, weights=weights))
-        return bx, by
+
+        return {
+            "bx": bx,
+            "by": by,
+            "cluster": cluster_est
+        }
 
     def run(self):
         while self.running:
-            board_points_conf = []
+            per_cam_estimates = []
             takeout_votes = 0
 
-            # 1) pro Cam lesen + AbsDiff Tip finden + optional Debug anzeigen
+            # 1) pro Cam lesen + AbsDiff + Vector
             for i, cam in enumerate(self.cameras):
                 ret, frame = cam.read()
                 if not ret or frame is None or cam.H is None:
                     continue
 
-                tips = self.absdet[i].detect(frame, board_center_full=cam.board_center_full)
-                if tips:
-                    best = tips[0]
-                    tip_full = best["tip"]
+                # AbsDiff Kandidaten (Tip im Fullframe)
+                abs_cands = self.absdet[i].detect(frame, board_center_full=cam.board_center_full)
 
+                # Vector Kandidaten (Tip im Fullframe)
+                vec_cands = self.vecdet[i].detect(
+                    frame,
+                    board_center_full=cam.board_center_full,
+                    board_roi_mask_full=cam.board_roi_mask_full
+                )
+
+                best = self.pick_best_per_cam(abs_cands, vec_cands)
+                if best is not None:
+                    tip_full = best["tip"]
                     tip_board = self.full_to_board(cam, tip_full[0], tip_full[1])
+
                     if tip_board is not None:
                         bx, by = tip_board
-                        board_points_conf.append((bx, by, best["confidence"], cam.cam_id, tip_full))
+                        per_cam_estimates.append({
+                            "cam_id": cam.cam_id,
+                            "bx": bx,
+                            "by": by,
+                            "confidence": best["confidence"],
+                            "tip_full": tip_full,
+                            "src": best["src"]
+                        })
 
+                    # Debug
                     if self.debugger:
                         self.debugger.show(cam.cam_id, frame, cam.H, tip_full=tip_full, tip_board=tip_board)
                 else:
                     if self.debugger:
                         self.debugger.show(cam.cam_id, frame, cam.H, tip_full=None, tip_board=None)
 
-                # Takeout nur sinnvoll, wenn vorher ein Dart erkannt wurde
+                # Takeout voting (nur wenn vorher ein Hit war)
                 if self.last_hit_board is not None:
                     if self.takeout[i].check_takeout(frame, cam.H):
                         takeout_votes += 1
 
-            # 2) Takeout-Event (2/3 Kameras reichen)
+            # 2) Takeout (2/3 reicht)
             if self.last_hit_board is not None and takeout_votes >= 2:
                 self.last_hit_board = None
                 self.hit_candidate = None
@@ -244,16 +322,16 @@ class DartVisionSystem:
                 time.sleep(0.05)
                 continue
 
-            # 3) Hit-Fusion + Temporal Confirm + Duplicate Filter
-            fused = self.fuse_points(board_points_conf)
+            # 3) MultiCam Fusion robust
+            fused = self.fuse_multicam_robust(per_cam_estimates, cluster_dist=60.0)
             if fused is None:
                 time.sleep(0.005)
                 continue
 
-            bx, by = fused
+            bx, by = fused["bx"], fused["by"]
             now = time.time()
 
-            # Temporal verification
+            # 4) Temporal verification (gegen Ghosts)
             if self.hit_candidate is None:
                 self.hit_candidate = (bx, by)
                 self.hit_candidate_time = now
@@ -275,21 +353,33 @@ class DartVisionSystem:
                 if old_dist < 18:
                     continue
 
-            # 4) Missed vs Score an main.py
+            # 5) Missed vs Score
             if self.is_missed(bx, by):
-                payload = {"is_missed": True, "sector": 0, "board_x": bx, "board_y": by}
+                payload = {
+                    "is_missed": True,
+                    "sector": 0,
+                    "board_x": bx,
+                    "board_y": by,
+                    "fusion": [{"cam": e["cam_id"], "src": e["src"], "conf": e["confidence"]} for e in fused["cluster"]]
+                }
             else:
                 sector, mult = self.get_score(bx, by)
-                payload = {"is_missed": False, "sector": sector, "multiplier": mult, "board_x": bx, "board_y": by}
+                payload = {
+                    "is_missed": False,
+                    "sector": sector,
+                    "multiplier": mult,
+                    "board_x": bx,
+                    "board_y": by,
+                    "fusion": [{"cam": e["cam_id"], "src": e["src"], "conf": e["confidence"]} for e in fused["cluster"]]
+                }
 
             self.hit_callback(payload)
 
-            # 5) State update + references
+            # 6) state update + references
             self.last_hit_board = (bx, by)
             self.last_hit_time = now
             self.hit_candidate = None
 
-            # kurze Settle-time, dann reference aktualisieren
             time.sleep(0.25)
             self.set_references()
 
