@@ -1,49 +1,54 @@
 import cv2
 import numpy as np
 
-class AbsDiffTipDetector:
+class AbsDiffDetector:
     """
-    Detects a dart tip in FULL FRAME using absdiff to a reference frame.
-    Returns candidates with tip (x,y) in FULL FRAME coordinates.
+    AbsDiff-basierte Darterkennung im Full-Frame.
+    Liefert Tip-Kandidaten (x,y) im Full-Frame.
     """
 
     def __init__(self):
-        self.reference_gray = None
+        self.ref_gray = None
 
-        # Tuning
+        # Tuning (Startwerte)
         self.min_area = 120
-        self.max_area = 25000
+        self.max_area = 30000
         self.min_length = 18
+
         self.blur = (5, 5)
 
-    def set_reference(self, frame_bgr):
-        self.reference_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        # Tip-Glättung / Doppelkonturen
+        self.merge_tip_dist = 25
 
-    def detect(self, frame_bgr):
-        if self.reference_gray is None:
-            return [], frame_bgr
+    def set_reference(self, frame_bgr):
+        self.ref_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+
+    def detect(self, frame_bgr, board_center_full=None):
+        if self.ref_gray is None:
+            return []
 
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        diff = cv2.absdiff(self.reference_gray, gray)
+        diff = cv2.absdiff(self.ref_gray, gray)
 
-        # Slight blur to reduce sensor noise
-        diff_blur = cv2.GaussianBlur(diff, self.blur, 0)
+        # Noise
+        diff = cv2.GaussianBlur(diff, self.blur, 0)
 
-        # OTSU threshold
-        _, thr = cv2.threshold(diff_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # OTSU
+        _, thr = cv2.threshold(diff, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-        # Morph close helps connect fragmented dart shapes
+        # Morph close gegen Fragmentierung
         kernel = np.ones((3, 3), np.uint8)
         thr = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, kernel, iterations=1)
 
         contours, _ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         h, w = gray.shape[:2]
-        board_center_full = np.array([w // 2, h // 2], dtype=np.float32)  # will be replaced by projected center externally (optional)
+        if board_center_full is None:
+            board_center_full = np.array([w / 2, h / 2], dtype=np.float32)
+        else:
+            board_center_full = np.array(board_center_full, dtype=np.float32)
 
-        debug = frame_bgr.copy()
-        objects = []
-
+        raw = []
         for cnt in contours:
             area = cv2.contourArea(cnt)
             if area < self.min_area or area > self.max_area:
@@ -52,14 +57,12 @@ class AbsDiffTipDetector:
                 continue
 
             pts = cnt.reshape(-1, 2).astype(np.float32)
-
             mean, eigenvecs = cv2.PCACompute(pts, mean=None)
             center = mean[0]
-            axis = eigenvecs[0]  # principal axis direction
+            axis = eigenvecs[0]  # Hauptachse
 
-            # Two directions. Choose direction that points "towards board center"
-            # If dot(axis, (board_center - center)) < 0 -> invert
-            if np.dot(axis, board_center_full - center) < 0:
+            # Richtung zum Board-Zentrum wählen (damit Tip eher "ins Board" zeigt)
+            if np.dot(axis, (board_center_full - center)) < 0:
                 axis = -axis
 
             proj = np.dot(pts - center, axis)
@@ -69,30 +72,31 @@ class AbsDiffTipDetector:
             if length < self.min_length:
                 continue
 
-            # Tip is the farthest point along axis towards board
+            # Tip = die "besten" Punkte entlang der Achse (Richtung board_center)
             idxs = np.argsort(proj)[-3:]
             tip = np.mean(pts[idxs], axis=0)
 
-            # Slenderness confidence
+            # Confidence: lang + schlank + Fläche (Flight produziert oft breite Formen -> schlechter)
             width = max(area / max(length, 1e-6), 1.0)
             slenderness = length / width
-            confidence = length * slenderness * np.log(area + 1)
+            confidence = float(length * slenderness * np.log(area + 1))
 
-            objects.append({
+            raw.append({
                 "tip": (float(tip[0]), float(tip[1])),
+                "confidence": confidence,
                 "area": float(area),
-                "length": length,
-                "confidence": float(confidence),
                 "contour": cnt
             })
 
-        # Draw debug (optional)
-        for obj in objects:
-            cv2.drawContours(debug, [obj["contour"]], 0, (0, 255, 0), 1)
-            tx, ty = int(obj["tip"][0]), int(obj["tip"][1])
-            cv2.circle(debug, (tx, ty), 6, (0, 0, 255), -1)
+        # Doppelkonturen mergen (Tip-Nähe)
+        merged = []
+        for obj in sorted(raw, key=lambda o: o["confidence"], reverse=True):
+            keep = True
+            for m in merged:
+                if np.linalg.norm(np.array(obj["tip"]) - np.array(m["tip"])) < self.merge_tip_dist:
+                    keep = False
+                    break
+            if keep:
+                merged.append(obj)
 
-        # Sort descending by confidence
-        objects.sort(key=lambda o: o["confidence"], reverse=True)
-
-        return objects, debug, thr
+        return merged
