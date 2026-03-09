@@ -53,6 +53,7 @@ class CameraHandler:
         self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
         self.cap.set(cv2.CAP_PROP_EXPOSURE, -7)
         self.cap.set(cv2.CAP_PROP_GAIN, 10)
+
         if self.cam_id == 2:
             self.cap.set(cv2.CAP_PROP_BRIGHTNESS, 100)
         else:
@@ -94,7 +95,12 @@ class CameraHandler:
         left_x = target_center - dist_double_px * 0.987
         left_y = target_center - dist_double_px * 0.156
 
-        pts2 = np.float32([[top_x, top_y], [right_x, right_y], [bot_x, bot_y], [left_x, left_y]])
+        pts2 = np.float32([
+            [top_x, top_y],
+            [right_x, right_y],
+            [bot_x, bot_y],
+            [left_x, left_y]
+        ])
 
         self.H = cv2.getPerspectiveTransform(pts1, pts2)
         try:
@@ -113,7 +119,6 @@ class DartVisionSystem:
         self.hit_callback = hit_callback
         self.cameras = [CameraHandler(i) for i in range(3)]
 
-        # Board mask + scale
         self.board_mask = np.zeros((600, 600), dtype=np.uint8)
         total_radius_mm = 170.0 + 55.0
         self.px_per_mm_calc = (600 * 0.70) / (total_radius_mm * 2)
@@ -131,10 +136,22 @@ class DartVisionSystem:
         self.FREEZE_MEAN = 20
         self.FREEZE_MAX = 70
 
-        self.abs_detectors = [AbsDiffDetector(self.board_mask, self.FREEZE_MEAN, self.FREEZE_MAX) for _ in range(3)]
-        self.shape_detectors = [ShapeDetector(self.board_mask, self.FREEZE_MEAN, self.FREEZE_MAX) for _ in range(3)]
-        self.vec_detectors = [VectorDetector() for _ in range(3)]
-        self.takeout_detectors = [TakeoutDetector(self.board_mask) for _ in range(3)]
+        self.abs_detectors = [
+            AbsDiffDetector(self.board_mask, self.FREEZE_MEAN, self.FREEZE_MAX)
+            for _ in range(3)
+        ]
+        self.shape_detectors = [
+            ShapeDetector(self.board_mask, self.FREEZE_MEAN, self.FREEZE_MAX)
+            for _ in range(3)
+        ]
+        self.vec_detectors = [
+            VectorDetector()
+            for _ in range(3)
+        ]
+        self.takeout_detectors = [
+            TakeoutDetector(self.board_mask)
+            for _ in range(3)
+        ]
 
         self.debugger = VisionDebugger(warp_size=800)
 
@@ -169,36 +186,35 @@ class DartVisionSystem:
 
                     gray_warped = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
 
-                    # Motion freeze (Boardspace)
                     cam_is_moving = False
                     if cam.reference_gray is not None:
                         diff_motion = cv2.absdiff(gray_warped, cam.reference_gray)
                         mean_val = float(cv2.mean(diff_motion)[0])
                         _, max_val, _, _ = cv2.minMaxLoc(diff_motion)
+
                         if mean_val > self.FREEZE_MEAN and max_val < self.FREEZE_MAX:
                             cam_is_moving = True
                             board_is_moving = True
 
-                    # Takeout
-                    takeout_detected, _take_dbg = self.takeout_detectors[idx].check_takeout(warped, self.last_hit_contours)
+                    # Takeout läuft immer
+                    takeout_detected, _take_dbg = self.takeout_detectors[idx].check_takeout(
+                        warped, self.last_hit_contours
+                    )
                     if not takeout_detected:
                         all_cameras_empty = False
 
-                    # AbsDiff Kandidaten (Boardspace)
+                    # Detektoren
                     abs_objs, _abs_dbg = self.abs_detectors[idx].detect(warped, gray_warped)
-
-                    # Shape Kandidaten (Boardspace)
                     shape_objs, _shape_dbg = self.shape_detectors[idx].detect(warped, gray_warped)
 
-                    # Vector Kandidaten (Fullframe) -> map to Board
-                    h_full, w_full = frame.shape[:2]
                     board_center_full = None
                     if cam.invH is not None:
                         board_center_full = pt_transform(cam.invH, (300.0, 300.0))
 
                     roi_mask_full = None
                     if cam.invH is not None:
-                        roi_mask_full = cv2.warpPerspective(self.board_mask, cam.invH, (w_full, h_full))
+                        full_h, full_w = frame.shape[:2]
+                        roi_mask_full = cv2.warpPerspective(self.board_mask, cam.invH, (full_w, full_h))
 
                     vec_objs_full = self.vec_detectors[idx].detect(
                         frame_bgr=frame,
@@ -213,7 +229,7 @@ class DartVisionSystem:
                             tip_board = pt_transform(cam.H, tip_full)
                             vec_objs.append({
                                 "tip_board": tip_board,
-                                "confidence": float(o["confidence"]),
+                                "confidence": float(o.get("confidence", 0.0)),
                                 "contour": None,
                                 "extra": {
                                     "line_full": o.get("line", None),
@@ -223,7 +239,7 @@ class DartVisionSystem:
 
                     best = self._select_best(abs_objs, shape_objs, vec_objs)
 
-                    # Debug
+                    # Debuganzeige
                     if best is not None:
                         tip_board = best["tip_board"]
                         tip_full = None
@@ -245,7 +261,7 @@ class DartVisionSystem:
                             conf=float(best["confidence"])
                         )
 
-                    # Wenn Board/Kamera wackelt: keine Hits sammeln
+                    # Bei Bewegung keine Treffer sammeln
                     if cam_is_moving:
                         continue
 
@@ -260,7 +276,6 @@ class DartVisionSystem:
                             "src": best["src"]
                         })
 
-                # Bei Bewegung Candidate reset
                 if board_is_moving:
                     self.hit_candidate = None
                     time.sleep(0.01)
@@ -275,18 +290,21 @@ class DartVisionSystem:
                     self.reset_references()
                     self.hit_callback("NEXT_PLAYER")
 
-                # Hit Fusion
+                # Multicam Fusion
                 if len(cam_hits) >= 2:
                     fused = self._fuse_hits(cam_hits)
                     if fused is not None:
                         final_x, final_y, dist_ok = fused
                         if dist_ok:
                             current_point = (final_x, final_y)
+
                             if self.hit_candidate is None:
                                 self.hit_candidate = current_point
                                 self.hit_candidate_time = time.time()
                             else:
-                                dist_prev = float(np.linalg.norm(np.array(current_point) - np.array(self.hit_candidate)))
+                                dist_prev = float(
+                                    np.linalg.norm(np.array(current_point) - np.array(self.hit_candidate))
+                                )
                                 if dist_prev < 18 and (time.time() - self.hit_candidate_time) < 0.25:
                                     self.hit_candidate = None
                                     self._emit_score(final_x, final_y)
@@ -376,29 +394,30 @@ class DartVisionSystem:
 
     def _fuse_local_candidates(self, cands, merge_dist=20.0):
         """
-        Fusion auf EINER Kamera:
-        - wenn abs + shape nah beieinander liegen -> lokale Fusion
-        - vec wird nur mitgemischt, wenn er nah genug ist
+        Fusion auf einer Kamera:
+        - abs + shape werden bevorzugt zusammengeführt
+        - vec wird nur übernommen, wenn er räumlich passt
         """
         if not cands:
             return None
         if len(cands) == 1:
             return cands[0]
 
-        # beste Gruppe naher Kandidaten suchen
         best_group = []
         for i, a in enumerate(cands):
             group = [a]
             for j, b in enumerate(cands):
                 if i == j:
                     continue
-                da = np.linalg.norm(np.array(a["tip_board"]) - np.array(b["tip_board"]))
-                if da < merge_dist:
+                d = np.linalg.norm(np.array(a["tip_board"]) - np.array(b["tip_board"]))
+                if d < merge_dist:
                     group.append(b)
+
             if len(group) > len(best_group):
                 best_group = group
-            elif len(group) == len(best_group) and sum(g["confidence"] for g in group) > sum(g["confidence"] for g in best_group):
-                best_group = group
+            elif len(group) == len(best_group):
+                if sum(g["confidence"] for g in group) > sum(g["confidence"] for g in best_group):
+                    best_group = group
 
         if len(best_group) == 1:
             return max(cands, key=lambda x: x["confidence"])
@@ -419,16 +438,11 @@ class DartVisionSystem:
         }
 
     def _select_best(self, abs_objs, shape_objs, vec_objs):
-        """
-        Pro Kamera:
-        - abs + shape sind Boardspace-Detektoren und werden bevorzugt lokal fusioniert
-        - vector darf ergänzen, dominiert aber nicht blind
-        """
         cands = []
 
         best_abs = self._pick_best_obj(abs_objs, "abs", conf_scale=1.0)
         best_shape = self._pick_best_obj(shape_objs, "shape", conf_scale=1.0)
-        best_vec = self._pick_best_obj(vec_objs, "vec", conf_scale=0.55)  # skaliert, damit Hough nicht alles dominiert
+        best_vec = self._pick_best_obj(vec_objs, "vec", conf_scale=0.55)
 
         if best_abs is not None:
             cands.append(best_abs)
@@ -440,9 +454,7 @@ class DartVisionSystem:
         if not cands:
             return None
 
-        # Lokale Fusion naher Kandidaten
-        fused = self._fuse_local_candidates(cands, merge_dist=22.0)
-        return fused
+        return self._fuse_local_candidates(cands, merge_dist=22.0)
 
     def _fuse_hits(self, cam_hits):
         cam_hits = sorted(cam_hits, key=lambda d: d["confidence"], reverse=True)
