@@ -8,6 +8,7 @@ import time
 from vision_absdiff import AbsDiffDetector
 from vision_takeout import TakeoutDetector
 from vision_vector import VectorDetector
+from vision_shape import ShapeDetector
 from vision_debug import VisionDebugger
 
 
@@ -68,7 +69,7 @@ class CameraHandler:
                 pts = data.get("points", [])
                 if isinstance(pts, list) and len(pts) == 4:
                     self.src_points = pts
-            except:
+            except Exception:
                 print(f"[ERROR] Config für Cam {self.cam_id} konnte nicht geladen werden.")
 
     def compute_homography(self):
@@ -98,7 +99,7 @@ class CameraHandler:
         self.H = cv2.getPerspectiveTransform(pts1, pts2)
         try:
             self.invH = np.linalg.inv(self.H)
-        except:
+        except Exception:
             self.invH = None
 
     def warp_to_board(self, frame_bgr, size=600):
@@ -131,6 +132,7 @@ class DartVisionSystem:
         self.FREEZE_MAX = 70
 
         self.abs_detectors = [AbsDiffDetector(self.board_mask, self.FREEZE_MEAN, self.FREEZE_MAX) for _ in range(3)]
+        self.shape_detectors = [ShapeDetector(self.board_mask, self.FREEZE_MEAN, self.FREEZE_MAX) for _ in range(3)]
         self.vec_detectors = [VectorDetector() for _ in range(3)]
         self.takeout_detectors = [TakeoutDetector(self.board_mask) for _ in range(3)]
 
@@ -168,11 +170,13 @@ class DartVisionSystem:
                     gray_warped = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
 
                     # Motion freeze (Boardspace)
+                    cam_is_moving = False
                     if cam.reference_gray is not None:
                         diff_motion = cv2.absdiff(gray_warped, cam.reference_gray)
                         mean_val = float(cv2.mean(diff_motion)[0])
                         _, max_val, _, _ = cv2.minMaxLoc(diff_motion)
                         if mean_val > self.FREEZE_MEAN and max_val < self.FREEZE_MAX:
+                            cam_is_moving = True
                             board_is_moving = True
 
                     # Takeout
@@ -183,13 +187,15 @@ class DartVisionSystem:
                     # AbsDiff Kandidaten (Boardspace)
                     abs_objs, _abs_dbg = self.abs_detectors[idx].detect(warped, gray_warped)
 
+                    # Shape Kandidaten (Boardspace)
+                    shape_objs, _shape_dbg = self.shape_detectors[idx].detect(warped, gray_warped)
+
                     # Vector Kandidaten (Fullframe) -> map to Board
                     h_full, w_full = frame.shape[:2]
                     board_center_full = None
                     if cam.invH is not None:
                         board_center_full = pt_transform(cam.invH, (300.0, 300.0))
 
-                    # ROI Maske in Fullframe (nur zur Gewichtung, kein harter Crop)
                     roi_mask_full = None
                     if cam.invH is not None:
                         roi_mask_full = cv2.warpPerspective(self.board_mask, cam.invH, (w_full, h_full))
@@ -215,9 +221,9 @@ class DartVisionSystem:
                                 }
                             })
 
-                    best = self._select_best(abs_objs, vec_objs)
+                    best = self._select_best(abs_objs, shape_objs, vec_objs)
 
-                    # Debug: show best per cam (wenn enabled)
+                    # Debug
                     if best is not None:
                         tip_board = best["tip_board"]
                         tip_full = None
@@ -225,7 +231,7 @@ class DartVisionSystem:
                             tip_full = pt_transform(cam.invH, tip_board)
 
                         line_full = None
-                        if best["src"] == "vec":
+                        if "vec" in best["src"]:
                             line_full = best.get("extra", {}).get("line_full", None)
 
                         self.debugger.show(
@@ -239,11 +245,10 @@ class DartVisionSystem:
                             conf=float(best["confidence"])
                         )
 
-                    # Wenn Board wackelt: keine Hits sammeln (aber Takeout läuft)
-                    if board_is_moving:
+                    # Wenn Board/Kamera wackelt: keine Hits sammeln
+                    if cam_is_moving:
                         continue
 
-                    # Kandidaten sammeln
                     if best is not None and (time.time() - self.last_hit_time > 0.25):
                         if best.get("contour", None) is not None:
                             self.last_hit_contours[cam.cam_id] = best["contour"]
@@ -276,7 +281,6 @@ class DartVisionSystem:
                     if fused is not None:
                         final_x, final_y, dist_ok = fused
                         if dist_ok:
-                            # Temporal verification
                             current_point = (final_x, final_y)
                             if self.hit_candidate is None:
                                 self.hit_candidate = current_point
@@ -300,15 +304,15 @@ class DartVisionSystem:
         for cam in self.cameras:
             try:
                 cam.cap.release()
-            except:
+            except Exception:
                 pass
         try:
             self.debugger.close()
-        except:
+        except Exception:
             pass
         try:
             cv2.destroyAllWindows()
-        except:
+        except Exception:
             pass
 
     def reset_references(self):
@@ -332,6 +336,7 @@ class DartVisionSystem:
             gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
 
             self.abs_detectors[idx].set_reference(warped)
+            self.shape_detectors[idx].set_reference(warped)
             self.takeout_detectors[idx].set_clean_board(warped)
             cam.reference_gray = gray
 
@@ -353,39 +358,91 @@ class DartVisionSystem:
 
             gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
             self.abs_detectors[idx].set_reference(warped)
+            self.shape_detectors[idx].set_reference(warped)
             cam.reference_gray = gray
 
-    def _select_best(self, abs_objs, vec_objs):
-        best = None
-        best_score = -1.0
+    def _pick_best_obj(self, objs, source_name, conf_scale=1.0):
+        if not objs:
+            return None
 
-        # Abs Kandidaten
-        for o in abs_objs:
-            c = float(o.get("confidence", 0.0))
-            if c > best_score:
-                best_score = c
-                best = {
-                    "src": "abs",
-                    "tip_board": o["tip_board"],
-                    "confidence": c,
-                    "contour": o.get("contour", None),
-                    "extra": o.get("extra", {})
-                }
+        best = max(objs, key=lambda o: float(o.get("confidence", 0.0)))
+        return {
+            "src": source_name,
+            "tip_board": best["tip_board"],
+            "confidence": float(best.get("confidence", 0.0)) * conf_scale,
+            "contour": best.get("contour", None),
+            "extra": best.get("extra", {})
+        }
 
-        # Vector Kandidaten (Bias: nur wenn klar besser)
-        for o in vec_objs:
-            c = float(o.get("confidence", 0.0))
-            if c > best_score * 1.15:
-                best_score = c
-                best = {
-                    "src": "vec",
-                    "tip_board": o["tip_board"],
-                    "confidence": c,
-                    "contour": None,
-                    "extra": o.get("extra", {})
-                }
+    def _fuse_local_candidates(self, cands, merge_dist=20.0):
+        """
+        Fusion auf EINER Kamera:
+        - wenn abs + shape nah beieinander liegen -> lokale Fusion
+        - vec wird nur mitgemischt, wenn er nah genug ist
+        """
+        if not cands:
+            return None
+        if len(cands) == 1:
+            return cands[0]
 
-        return best
+        # beste Gruppe naher Kandidaten suchen
+        best_group = []
+        for i, a in enumerate(cands):
+            group = [a]
+            for j, b in enumerate(cands):
+                if i == j:
+                    continue
+                da = np.linalg.norm(np.array(a["tip_board"]) - np.array(b["tip_board"]))
+                if da < merge_dist:
+                    group.append(b)
+            if len(group) > len(best_group):
+                best_group = group
+            elif len(group) == len(best_group) and sum(g["confidence"] for g in group) > sum(g["confidence"] for g in best_group):
+                best_group = group
+
+        if len(best_group) == 1:
+            return max(cands, key=lambda x: x["confidence"])
+
+        weights = np.array([g["confidence"] for g in best_group], dtype=np.float32)
+        pts = np.array([g["tip_board"] for g in best_group], dtype=np.float32)
+        fused = np.average(pts, axis=0, weights=weights)
+
+        best_contour_src = max(best_group, key=lambda x: x["confidence"])
+        src_name = "+".join(sorted(set(g["src"] for g in best_group)))
+
+        return {
+            "src": src_name,
+            "tip_board": (float(fused[0]), float(fused[1])),
+            "confidence": float(np.sum(weights)),
+            "contour": best_contour_src.get("contour", None),
+            "extra": best_contour_src.get("extra", {})
+        }
+
+    def _select_best(self, abs_objs, shape_objs, vec_objs):
+        """
+        Pro Kamera:
+        - abs + shape sind Boardspace-Detektoren und werden bevorzugt lokal fusioniert
+        - vector darf ergänzen, dominiert aber nicht blind
+        """
+        cands = []
+
+        best_abs = self._pick_best_obj(abs_objs, "abs", conf_scale=1.0)
+        best_shape = self._pick_best_obj(shape_objs, "shape", conf_scale=1.0)
+        best_vec = self._pick_best_obj(vec_objs, "vec", conf_scale=0.55)  # skaliert, damit Hough nicht alles dominiert
+
+        if best_abs is not None:
+            cands.append(best_abs)
+        if best_shape is not None:
+            cands.append(best_shape)
+        if best_vec is not None:
+            cands.append(best_vec)
+
+        if not cands:
+            return None
+
+        # Lokale Fusion naher Kandidaten
+        fused = self._fuse_local_candidates(cands, merge_dist=22.0)
+        return fused
 
     def _fuse_hits(self, cam_hits):
         cam_hits = sorted(cam_hits, key=lambda d: d["confidence"], reverse=True)
