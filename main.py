@@ -24,6 +24,7 @@ def resource_path(relative_path):
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from games.x01 import X01Game
+from games.cricket import CricketGame
 from throw import ThrowSimulator
 from database.database import DatabaseManager
 from vision import DartVisionSystem
@@ -57,6 +58,7 @@ class MainManager:
 
         self.state = "LOBBY"
         self.game_instance = None
+        self.selected_game_mode = "X01"
 
         # Setup Variablen
         self.selected_player_count = 0
@@ -75,7 +77,8 @@ class MainManager:
             "player_count": 0,
             "endlos": False,
             "legs_to_win": 3,
-            "sets_to_win": 1
+            "sets_to_win": 1,
+            "cut_throat": False
         }
         self.buttons = {}
 
@@ -237,27 +240,38 @@ class MainManager:
     def render_game_select(self, m_pos):
         title = self.font_title.render("SPIELAUSWAHL", True, (0, 220, 255))
         self.screen.blit(title, (960 - title.get_width() // 2, 100))
-        self.draw_button("X01 GAME", 760, 450, 400, 120, m_pos, "SELECT_X01", color=(0, 100, 200), font_type="bold")
+        self.draw_button("X01 GAME", 760, 390, 400, 120, m_pos, "SELECT_X01", color=(0, 100, 200), font_type="bold")
+        self.draw_button("CRICKET", 760, 560, 400, 120, m_pos, "SELECT_CRICKET", color=(0, 130, 110), font_type="bold")
         self.draw_button("ZURÜCK", 100, 920, 400, 100, m_pos, "GO_TO_LOBBY", color=(100, 20, 20))
 
     def render_settings(self, m_pos):
-        title = self.font_title.render("X01 EINSTELLUNGEN", True, (0, 220, 255))
+        title_text = "X01 EINSTELLUNGEN" if self.selected_game_mode == "X01" else "CRICKET EINSTELLUNGEN"
+        title = self.font_title.render(title_text, True, (0, 220, 255))
         self.screen.blit(title, (960 - title.get_width() // 2, 50))
 
-        self.draw_button("<", 750, 250, 60, 75, m_pos, "DEC_SCORE")
-        self.draw_button(f"SCORE: {self.config['start_score']}", 820, 250, 280, 75, m_pos, "NONE")
-        self.draw_button(">", 1110, 250, 60, 75, m_pos, "INC_SCORE")
+        if self.selected_game_mode == "X01":
+            self.draw_button("<", 750, 250, 60, 75, m_pos, "DEC_SCORE")
+            self.draw_button(f"SCORE: {self.config['start_score']}", 820, 250, 280, 75, m_pos, "NONE")
+            self.draw_button(">", 1110, 250, 60, 75, m_pos, "INC_SCORE")
 
-        self.draw_button(f"IN: {self.config['in_mode']}", 450, 400, 400, 80, m_pos, "TOGGLE_IN")
-        self.draw_button(f"OUT: {self.config['out_mode']}", 1050, 400, 400, 80, m_pos, "TOGGLE_OUT")
+            self.draw_button(f"IN: {self.config['in_mode']}", 450, 400, 400, 80, m_pos, "TOGGLE_IN")
+            self.draw_button(f"OUT: {self.config['out_mode']}", 1050, 400, 400, 80, m_pos, "TOGGLE_OUT")
 
-        endlos_txt = "ENDLOS: AN" if self.config["endlos"] else "ENDLOS: AUS"
-        self.draw_button(endlos_txt, 760, 550, 400, 80, m_pos, "TOGGLE_ENDLOS", color=(100, 80, 20))
+            endlos_txt = "ENDLOS: AN" if self.config["endlos"] else "ENDLOS: AUS"
+            self.draw_button(endlos_txt, 760, 550, 400, 80, m_pos, "TOGGLE_ENDLOS", color=(100, 80, 20))
 
-        if not self.config["endlos"]:
-            self.draw_button("<", 750, 650, 60, 75, m_pos, "DEC_LEGS")
-            self.draw_button(f"LEGS: {self.config['legs_to_win']}", 820, 650, 280, 75, m_pos, "NONE")
-            self.draw_button(">", 1110, 650, 60, 75, m_pos, "INC_LEGS")
+            if not self.config["endlos"]:
+                self.draw_button("<", 750, 650, 60, 75, m_pos, "DEC_LEGS")
+                self.draw_button(f"LEGS: {self.config['legs_to_win']}", 820, 650, 280, 75, m_pos, "NONE")
+                self.draw_button(">", 1110, 650, 60, 75, m_pos, "INC_LEGS")
+        else:
+            mode_text = "MODUS: NORMAL" if not self.config["cut_throat"] else "MODUS: CUT THROAT"
+            mode_color = (0, 130, 110) if not self.config["cut_throat"] else (130, 50, 50)
+            self.draw_button(mode_text, 700, 360, 520, 100, m_pos, "TOGGLE_CRICKET_MODE", color=mode_color, font_type="bold")
+            hint1 = self.font_menu.render("Wie bei X01 zuerst den Modus wählen.", True, (220, 220, 220))
+            hint2 = self.font_menu.render("Danach unten rechts das Spiel starten.", True, (220, 220, 220))
+            self.screen.blit(hint1, (700, 520))
+            self.screen.blit(hint2, (700, 570))
 
         self.draw_button("ZURÜCK", 100, 920, 400, 100, m_pos, "GO_TO_SELECT", color=(100, 20, 20))
         self.draw_button("SPIEL STARTEN", 1420, 920, 400, 100, m_pos, "START_GAME", color=(20, 140, 20))
@@ -289,6 +303,11 @@ class MainManager:
                     self.state = "LOBBY"
 
                 elif action == "SELECT_X01":
+                    self.selected_game_mode = "X01"
+                    self.state = "SETTINGS"
+
+                elif action == "SELECT_CRICKET":
+                    self.selected_game_mode = "CRICKET"
                     self.state = "SETTINGS"
 
                 elif action == "INC_SCORE":
@@ -314,10 +333,16 @@ class MainManager:
                 elif action == "DEC_LEGS":
                     self.config["legs_to_win"] = max(1, self.config["legs_to_win"] - 1)
 
+                elif action == "TOGGLE_CRICKET_MODE":
+                    self.config["cut_throat"] = not self.config["cut_throat"]
+
                 elif action == "START_GAME":
                     names = self.finalize_selected_players()
                     self.config["player_count"] = len(names)
-                    self.game_instance = X01Game(self.screen, self.config, player_names=names)
+                    if self.selected_game_mode == "CRICKET":
+                        self.game_instance = CricketGame(self.screen, self.config, player_names=names)
+                    else:
+                        self.game_instance = X01Game(self.screen, self.config, player_names=names)
                     self.state = "GAME"
 
                 # --- KALIBRIERUNG DIREKT AUFRUFEN ---
@@ -383,8 +408,13 @@ class MainManager:
                             self.game_instance.handle_throw(0, 1)
                         else:
                             sector = item.get("sector", 0)
-                            print(f"[MAIN] Treffer im Board: Sector {sector}")
-                            self.game_instance.handle_throw(sector, 1)
+                            ring = item.get("ring", "single")
+                            mult_map = {"single": 1, "double": 2, "triple": 3, "single_bull": 1, "bull": 2}
+                            mult = mult_map.get(ring, 1)
+                            if ring in ["single_bull", "bull"]:
+                                sector = 25
+                            print(f"[MAIN] Treffer im Board: Sector {sector} Ring {ring}")
+                            self.game_instance.handle_throw(sector, mult)
 
             # --- 2. EVENTS ---
             for ev in pygame.event.get():
