@@ -170,8 +170,6 @@ class DartVisionSystem:
         self.board_empty_state = True
 
         self.hit_blocked_until = time.time() + 2.0
-
-        # --- Neu: Konsolen-Debug ---
         self.console_debug = True
 
     def _dbg(self, msg):
@@ -226,18 +224,11 @@ class DartVisionSystem:
                         takeout_detected, _take_dbg = self.takeout_detectors[idx].check_takeout(
                             warped, self.last_hit_contours
                         )
-                        self._dbg(
-                            f"[CAM {cam.cam_id}] TAKEOUT empty={takeout_detected}"
-                        )
                         if not takeout_detected:
                             all_cameras_empty = False
 
                     abs_objs, _abs_dbg = self.abs_detectors[idx].detect(warped, gray_warped)
                     shape_objs, _shape_dbg = self.shape_detectors[idx].detect(warped, gray_warped)
-
-                    self._dbg(
-                        f"[CAM {cam.cam_id}] COUNTS abs={len(abs_objs)} shape={len(shape_objs)}"
-                    )
 
                     board_center_full = None
                     if cam.invH is not None:
@@ -248,11 +239,13 @@ class DartVisionSystem:
                         full_h, full_w = frame.shape[:2]
                         roi_mask_full = cv2.warpPerspective(self.board_mask, cam.invH, (full_w, full_h))
 
-                    vec_objs_full = self.vec_detectors[idx].detect(
-                        frame_bgr=frame,
-                        board_center_full=board_center_full,
-                        board_roi_mask_full=roi_mask_full
-                    )
+                    vec_objs_full = []
+                    if len(abs_objs) > 0:
+                        vec_objs_full = self.vec_detectors[idx].detect(
+                            frame_bgr=frame,
+                            board_center_full=board_center_full,
+                            board_roi_mask_full=roi_mask_full
+                        )
 
                     vec_objs = []
                     if cam.H is not None:
@@ -269,24 +262,18 @@ class DartVisionSystem:
                                 }
                             })
 
-                    self._dbg(
-                        f"[CAM {cam.cam_id}] COUNTS vec={len(vec_objs)}"
-                    )
+                    if len(abs_objs) > 0 or len(shape_objs) > 0 or len(vec_objs) > 0:
+                        self._dbg(
+                            f"[CAM {cam.cam_id}] COUNTS abs={len(abs_objs)} shape={len(shape_objs)} vec={len(vec_objs)}"
+                        )
 
                     best = self._select_best(abs_objs, shape_objs, vec_objs)
 
                     if best is not None:
                         bx, by = best["tip_board"]
-                        self._dbg(
-                            f"[CAM {cam.cam_id}] BEST src={best['src']} "
-                            f"tip_board=({bx:.1f},{by:.1f}) "
-                            f"conf={float(best['confidence']):.1f}"
-                        )
-
-                        tip_board = best["tip_board"]
                         tip_full = None
                         if cam.invH is not None:
-                            tip_full = pt_transform(cam.invH, tip_board)
+                            tip_full = pt_transform(cam.invH, (bx, by))
 
                         line_full = None
                         if "vec" in best["src"]:
@@ -297,35 +284,37 @@ class DartVisionSystem:
                             frame_bgr=frame,
                             H_cam_to_board=cam.H,
                             tip_full=tip_full,
-                            tip_board=tip_board,
+                            tip_board=(bx, by),
                             line_full=line_full,
                             method=best["src"],
                             conf=float(best["confidence"])
                         )
 
-                    if cam_is_moving:
-                        continue
+                        if not cam_is_moving and self._hits_allowed() and (time.time() - self.last_hit_time > 0.35):
+                            if best.get("contour", None) is not None:
+                                self.last_hit_contours[cam.cam_id] = best["contour"]
 
-                    if self._hits_allowed() and best is not None and (time.time() - self.last_hit_time > 0.35):
-                        if best.get("contour", None) is not None:
-                            self.last_hit_contours[cam.cam_id] = best["contour"]
-
-                        self._dbg(
-                            f"[CAM {cam.cam_id} -> HIT_CAND] "
-                            f"src={best['src']} "
-                            f"tip_board=({best['tip_board'][0]:.1f},{best['tip_board'][1]:.1f}) "
-                            f"conf={float(best['confidence']):.1f}"
-                        )
-
-                        cam_hits.append({
-                            "cam_id": cam.cam_id,
-                            "tip_board": best["tip_board"],
-                            "confidence": float(best["confidence"]),
-                            "src": best["src"]
-                        })
-                    elif best is not None and not self._hits_allowed():
-                        self._dbg(
-                            f"[CAM {cam.cam_id}] BEST IGNORIERT (HIT BLOCK aktiv)"
+                            cam_hits.append({
+                                "cam_id": cam.cam_id,
+                                "tip_board": best["tip_board"],
+                                "confidence": float(best["confidence"]),
+                                "src": best["src"]
+                            })
+                            self._dbg(
+                                f"[CAM {cam.cam_id} -> HIT_CAND] src={best['src']} "
+                                f"tip=({best['tip_board'][0]:.1f},{best['tip_board'][1]:.1f}) "
+                                f"conf={float(best['confidence']):.1f}"
+                            )
+                    else:
+                        self.debugger.show(
+                            cam_id=cam.cam_id,
+                            frame_bgr=frame,
+                            H_cam_to_board=cam.H,
+                            tip_full=None,
+                            tip_board=None,
+                            line_full=None,
+                            method=None,
+                            conf=None
                         )
 
                 if board_is_moving:
@@ -337,27 +326,17 @@ class DartVisionSystem:
                 if tracking_active:
                     if all_cameras_empty:
                         self.takeout_empty_frames += 1
-                        self._dbg(
-                            f"[TAKEOUT] empty_frames={self.takeout_empty_frames}/{self.takeout_empty_frames_required}"
-                        )
                     else:
-                        if self.takeout_empty_frames > 0:
-                            self._dbg("[TAKEOUT] Reset empty_frames -> 0")
                         self.takeout_empty_frames = 0
                         self.board_empty_state = False
 
-                    if (
-                        self.takeout_empty_frames >= self.takeout_empty_frames_required
-                        and not self.board_empty_state
-                    ):
+                    if self.takeout_empty_frames >= self.takeout_empty_frames_required and not self.board_empty_state:
                         print("[INFO] Alle Darts entfernt.")
                         self.board_empty_state = True
                         self.takeout_empty_frames = 0
-
                         self.last_hit_board = None
                         self.last_hit_contours = {}
                         self.hit_candidate = None
-
                         self.reset_references()
                         self._block_hits(1.5)
                         self.hit_callback("NEXT_PLAYER")
@@ -371,22 +350,12 @@ class DartVisionSystem:
                         final_x, final_y, dist_ok = fused
                         if dist_ok:
                             current_point = (final_x, final_y)
-
                             if self.hit_candidate is None:
                                 self.hit_candidate = current_point
                                 self.hit_candidate_time = time.time()
-                                self._dbg(
-                                    f"[HIT CAND START] point=({final_x},{final_y})"
-                                )
+                                self._dbg(f"[HIT CAND START] point=({final_x},{final_y})")
                             else:
-                                dist_prev = float(
-                                    np.linalg.norm(np.array(current_point) - np.array(self.hit_candidate))
-                                )
-                                self._dbg(
-                                    f"[HIT CAND CHECK] prev=({self.hit_candidate[0]:.1f},{self.hit_candidate[1]:.1f}) "
-                                    f"curr=({final_x},{final_y}) dist={dist_prev:.1f} "
-                                    f"dt={(time.time() - self.hit_candidate_time):.3f}s"
-                                )
+                                dist_prev = float(np.linalg.norm(np.array(current_point) - np.array(self.hit_candidate)))
                                 if dist_prev < 18 and (time.time() - self.hit_candidate_time) < 0.25:
                                     self.hit_candidate = None
                                     self._emit_score(final_x, final_y)
@@ -394,10 +363,8 @@ class DartVisionSystem:
                                     self.hit_candidate = current_point
                                     self.hit_candidate_time = time.time()
                                     self._dbg(
-                                        f"[HIT CAND UPDATE] point=({final_x},{final_y})"
+                                        f"[HIT CAND UPDATE] point=({final_x},{final_y}) dist_prev={dist_prev:.1f}"
                                     )
-                        else:
-                            self._dbg("[FUSION] dist_ok=False -> verworfen")
 
                 time.sleep(0.001)
 
@@ -426,59 +393,40 @@ class DartVisionSystem:
             cam.load_config()
             cam.compute_homography()
             if cam.H is None:
-                self._dbg(f"[RESET REFERENCES] Cam {cam.cam_id} hat keine Homography")
                 continue
 
             for _ in range(12):
                 cam.cap.read()
 
             ret, frame = cam.cap.read()
-            if not ret or frame is None:
-                self._dbg(f"[RESET REFERENCES] Cam {cam.cam_id} liefert kein Frame")
-                continue
-
-            warped = cam.warp_to_board(frame, 600)
-            if warped is None:
-                self._dbg(f"[RESET REFERENCES] Cam {cam.cam_id} warp fehlgeschlagen")
-                continue
-
-            gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-
-            self.abs_detectors[idx].set_reference(warped)
-            self.shape_detectors[idx].set_reference(warped)
-            self.takeout_detectors[idx].set_clean_board(warped)
-            cam.reference_gray = gray
-
-            self._dbg(f"[RESET REFERENCES] Cam {cam.cam_id} Referenzen gesetzt")
+            if ret and frame is not None:
+                warped = cam.warp_to_board(frame, 600)
+                if warped is not None:
+                    gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+                    self.abs_detectors[idx].set_reference(warped)
+                    self.shape_detectors[idx].set_reference(warped)
+                    self.takeout_detectors[idx].set_clean_board(warped)
+                    cam.reference_gray = gray
+                    self._dbg(f"[RESET REFERENCES] Cam {cam.cam_id} Referenzen gesetzt")
 
         self._block_hits(2.0)
 
     def update_references(self):
-        self._dbg("[UPDATE REFERENCES] Aktualisiere Referenzen nach Treffer")
         for idx, cam in enumerate(self.cameras):
             if cam.H is None:
-                self._dbg(f"[UPDATE REFERENCES] Cam {cam.cam_id} hat keine Homography")
                 continue
 
             for _ in range(8):
                 cam.cap.read()
 
             ret, frame = cam.cap.read()
-            if not ret or frame is None:
-                self._dbg(f"[UPDATE REFERENCES] Cam {cam.cam_id} liefert kein Frame")
-                continue
-
-            warped = cam.warp_to_board(frame, 600)
-            if warped is None:
-                self._dbg(f"[UPDATE REFERENCES] Cam {cam.cam_id} warp fehlgeschlagen")
-                continue
-
-            gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-            self.abs_detectors[idx].set_reference(warped)
-            self.shape_detectors[idx].set_reference(warped)
-            cam.reference_gray = gray
-
-            self._dbg(f"[UPDATE REFERENCES] Cam {cam.cam_id} Referenzen aktualisiert")
+            if ret and frame is not None:
+                warped = cam.warp_to_board(frame, 600)
+                if warped is not None:
+                    gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+                    self.abs_detectors[idx].set_reference(warped)
+                    self.shape_detectors[idx].set_reference(warped)
+                    cam.reference_gray = gray
 
         self._block_hits(0.8)
 
@@ -495,114 +443,74 @@ class DartVisionSystem:
             "extra": best.get("extra", {})
         }
 
+    def _select_best(self, abs_objs, shape_objs, vec_objs):
+        cands = []
+
+        best_abs = self._pick_best_obj(abs_objs, "abs", 1.0)
+        best_shape = self._pick_best_obj(shape_objs, "shape", 1.0)
+        best_vec = self._pick_best_obj(vec_objs, "vec", 0.45)
+
+        if best_abs is not None:
+            cands.append(best_abs)
+            abs_pt = np.array(best_abs["tip_board"])
+
+            if best_shape is not None:
+                if np.linalg.norm(abs_pt - np.array(best_shape["tip_board"])) < 35.0:
+                    cands.append(best_shape)
+
+            if best_vec is not None:
+                if np.linalg.norm(abs_pt - np.array(best_vec["tip_board"])) < 35.0:
+                    cands.append(best_vec)
+        else:
+            return None
+
+        return self._fuse_local_candidates(cands, merge_dist=25.0)
+
     def _fuse_local_candidates(self, cands, merge_dist=20.0):
         if not cands:
             return None
         if len(cands) == 1:
             return cands[0]
 
-        best_group = []
-        for i, a in enumerate(cands):
-            group = [a]
-            for j, b in enumerate(cands):
-                if i == j:
-                    continue
-                d = np.linalg.norm(np.array(a["tip_board"]) - np.array(b["tip_board"]))
-                if d < merge_dist:
-                    group.append(b)
-
-            if len(group) > len(best_group):
-                best_group = group
-            elif len(group) == len(best_group):
-                if sum(g["confidence"] for g in group) > sum(g["confidence"] for g in best_group):
-                    best_group = group
-
-        if len(best_group) == 1:
-            best_single = max(cands, key=lambda x: x["confidence"])
-            self._dbg(
-                f"[LOCAL FUSION] Single src={best_single['src']} "
-                f"tip=({best_single['tip_board'][0]:.1f},{best_single['tip_board'][1]:.1f}) "
-                f"conf={best_single['confidence']:.1f}"
-            )
-            return best_single
-
-        weights = np.array([g["confidence"] for g in best_group], dtype=np.float32)
-        pts = np.array([g["tip_board"] for g in best_group], dtype=np.float32)
+        weights = np.array([g["confidence"] for g in cands], dtype=np.float32)
+        pts = np.array([g["tip_board"] for g in cands], dtype=np.float32)
         fused = np.average(pts, axis=0, weights=weights)
 
-        best_contour_src = max(best_group, key=lambda x: x["confidence"])
-        src_name = "+".join(sorted(set(g["src"] for g in best_group)))
-
-        self._dbg(
-            "[LOCAL FUSION] "
-            + " | ".join(
-                [
-                    f"src={g['src']} tip=({g['tip_board'][0]:.1f},{g['tip_board'][1]:.1f}) conf={g['confidence']:.1f}"
-                    for g in best_group
-                ]
-            )
-            + f" || fused=({fused[0]:.1f},{fused[1]:.1f}) src={src_name}"
-        )
+        base_contour = None
+        base_extra = {}
+        for c in cands:
+            if c["src"] == "abs":
+                base_contour = c.get("contour", None)
+                base_extra = c.get("extra", {})
+                break
 
         return {
-            "src": src_name,
+            "src": "+".join(sorted(set(g["src"] for g in cands))),
             "tip_board": (float(fused[0]), float(fused[1])),
             "confidence": float(np.sum(weights)),
-            "contour": best_contour_src.get("contour", None),
-            "extra": best_contour_src.get("extra", {})
+            "contour": base_contour,
+            "extra": base_extra
         }
-
-    def _select_best(self, abs_objs, shape_objs, vec_objs):
-        cands = []
-
-        best_abs = self._pick_best_obj(abs_objs, "abs", conf_scale=1.0)
-        best_shape = self._pick_best_obj(shape_objs, "shape", conf_scale=1.0)
-        best_vec = self._pick_best_obj(vec_objs, "vec", conf_scale=0.45)
-
-        # vec nie alleine akzeptieren
-        if best_vec is not None and best_abs is None and best_shape is None:
-            best_vec = None
-
-        if best_abs is not None:
-            cands.append(best_abs)
-        if best_shape is not None:
-            cands.append(best_shape)
-        if best_vec is not None:
-            cands.append(best_vec)
-
-        if not cands:
-            return None
-
-        return self._fuse_local_candidates(cands, merge_dist=20.0)
 
     def _fuse_hits(self, cam_hits):
         cam_hits = sorted(cam_hits, key=lambda d: d["confidence"], reverse=True)
-
         if len(cam_hits) < 2:
             return None
 
-        p1 = np.array(cam_hits[0]["tip_board"], dtype=np.float32)
-        p2 = np.array(cam_hits[1]["tip_board"], dtype=np.float32)
+        p1, p2 = np.array(cam_hits[0]["tip_board"]), np.array(cam_hits[1]["tip_board"])
         dist = float(np.linalg.norm(p1 - p2))
         dist_ok = dist < 65
 
-        top = cam_hits[:3]
-        weights = np.array([min(h["confidence"], 1e6) for h in top], dtype=np.float32)
-        pts = np.array([h["tip_board"] for h in top], dtype=np.float32)
-
-        if float(np.sum(weights)) <= 1e-6:
-            return None
-
+        weights = np.array([h["confidence"] for h in cam_hits[:3]], dtype=np.float32)
+        pts = np.array([h["tip_board"] for h in cam_hits[:3]], dtype=np.float32)
         final = np.average(pts, axis=0, weights=weights)
 
         self._dbg(
             "[FUSION] "
             + " | ".join(
                 [
-                    f"cam={h['cam_id']} src={h['src']} "
-                    f"tip=({h['tip_board'][0]:.1f},{h['tip_board'][1]:.1f}) "
-                    f"conf={h['confidence']:.1f}"
-                    for h in top
+                    f"cam={h['cam_id']} src={h['src']} tip=({h['tip_board'][0]:.1f},{h['tip_board'][1]:.1f}) conf={h['confidence']:.1f}"
+                    for h in cam_hits[:3]
                 ]
             )
             + f" || final=({final[0]:.1f},{final[1]:.1f}) dist12={dist:.1f} dist_ok={dist_ok}"
@@ -611,32 +519,19 @@ class DartVisionSystem:
         return (int(final[0]), int(final[1]), dist_ok)
 
     def _emit_score(self, bx, by):
-        if not self._hits_allowed():
-            self._dbg("[EMIT] verworfen, weil HIT BLOCK aktiv")
-            return
-
         if self.last_hit_board is not None:
-            od = float(np.linalg.norm(np.array((bx, by)) - np.array(self.last_hit_board)))
-            if od < 18:
-                print("[DEBUG] Punkt zu nah am alten - verworfen")
-                self._dbg(
-                    f"[EMIT] Abstand zu last_hit_board=({self.last_hit_board[0]:.1f},{self.last_hit_board[1]:.1f}) "
-                    f"ist nur {od:.1f}"
-                )
+            if np.linalg.norm(np.array((bx, by)) - np.array(self.last_hit_board)) < 18:
+                self._dbg("[EMIT] Verworfen, zu nah am letzten Punkt")
                 return
 
         score_dict = self._score_from_board(bx, by)
-
         self.last_hit_board = (bx, by)
         self.last_hit_time = time.time()
         self.board_empty_state = False
         self.takeout_empty_frames = 0
 
         self._dbg(
-            f"[EMIT] board=({bx:.1f},{by:.1f}) "
-            f"sector={score_dict.get('sector')} "
-            f"ring={score_dict.get('ring', '-')} "
-            f"missed={score_dict.get('is_missed', False)}"
+            f"[EMIT] board=({bx:.1f},{by:.1f}) sector={score_dict.get('sector')} ring={score_dict.get('ring', '-')}"
         )
 
         self.hit_callback(score_dict)
@@ -656,20 +551,18 @@ class DartVisionSystem:
                 "board_y": float(y)
             }
 
-        angle = (np.degrees(np.arctan2(-rel_y, rel_x)) + 360) % 360
-        angle = (angle + self.WINKEL_OFFSET) % 360
-
+        angle = (np.degrees(np.arctan2(-rel_y, rel_x)) + 360 + self.WINKEL_OFFSET) % 360
         segments = [6, 13, 4, 18, 1, 20, 5, 12, 9, 14, 11, 8, 16, 7, 19, 3, 17, 2, 15, 10]
         val = segments[int((angle + 9) / 18) % 20]
 
         ring = "single"
-        if dist <= float(self.radii["bull"]):
+        if dist <= self.radii["bull"]:
             ring = "bull"
-        elif dist <= float(self.radii["single_bull"]):
+        elif dist <= self.radii["single_bull"]:
             ring = "single_bull"
-        elif float(self.radii["triple_inner"]) <= dist <= float(self.radii["triple_outer"]):
+        elif self.radii["triple_inner"] <= dist <= self.radii["triple_outer"]:
             ring = "triple"
-        elif float(self.radii["double_inner"]) <= dist <= float(self.radii["double_outer"]):
+        elif self.radii["double_inner"] <= dist <= self.radii["double_outer"]:
             ring = "double"
 
         return {

@@ -21,8 +21,8 @@ class VectorDetector:
         self.canny2 = 180
         self.blur = (5, 5)
 
-        self.hough_threshold = 65
-        self.min_line_len = 55
+        self.hough_threshold = 100
+        self.min_line_len = 80
         self.max_line_gap = 2
 
         self.max_candidates = 3

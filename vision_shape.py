@@ -34,10 +34,10 @@ class ShapeDetector:
         self.FREEZE_MAX = float(freeze_max)
 
         # Tuning
-        self.min_area = 180
+        self.min_area = 300
         self.max_area = 16000
         self.min_length = 16.0
-        self.min_elongation = 2.2
+        self.min_elongation = 3.5
         self.max_width = 40.0
         self.merge_dist = 20.0
 
