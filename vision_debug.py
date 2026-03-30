@@ -25,6 +25,11 @@ class VisionDebugger:
     - vec   = gelb
     - shape = magenta
     - fusion / kombiniert = cyan
+
+    Unterstützt jetzt auch Texte wie:
+    - "abs | Single 7"
+    - "abs | Double 19"
+    - "fusion | Triple 20"
     """
 
     def __init__(self, warp_size=800):
@@ -51,7 +56,6 @@ class VisionDebugger:
         show_full = True
         show_warp = True
 
-        # feste sinnvolle Fenstergrößen
         full_window_w = 1280
         full_window_h = 720
         warp_window_w = 1200
@@ -113,19 +117,42 @@ class VisionDebugger:
                         pass
                 self._windows_created.add(name)
 
-    def _get_method_color(self, method):
+    def _normalize_method_key(self, method):
         if method is None:
-            return (255, 255, 255)
+            return None
 
         m = str(method).lower().strip()
 
-        if "+" in m or "fusion" in m:
+        # Nur den linken Teil vor "|" als Methoden-Key werten
+        # z.B. "abs | double 19" -> "abs"
+        if "|" in m:
+            m = m.split("|", 1)[0].strip()
+
+        return m
+
+    def _extract_field_label(self, method):
+        if method is None:
+            return None
+
+        m = str(method).strip()
+        if "|" in m:
+            return m.split("|", 1)[1].strip()
+
+        return None
+
+    def _get_method_color(self, method):
+        key = self._normalize_method_key(method)
+
+        if key is None:
+            return (255, 255, 255)
+
+        if "+" in key or "fusion" in key or "combined" in key or "kombi" in key:
             return (255, 255, 0)  # cyan
-        if m == "abs":
+        if key == "abs":
             return (0, 0, 255)    # rot
-        if m == "vec":
+        if key == "vec":
             return (0, 255, 255)  # gelb
-        if m == "shape":
+        if key == "shape":
             return (255, 0, 255)  # magenta
 
         return (255, 255, 255)
@@ -174,6 +201,7 @@ class VisionDebugger:
 
         self._ensure_windows(cam_id)
         method_color = self._get_method_color(method)
+        field_label = self._extract_field_label(method)
 
         # ---------- FULL FRAME ----------
         if self.show_full:
@@ -205,7 +233,7 @@ class VisionDebugger:
                 hud,
                 (20, 40),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                1.1,
+                1.0,
                 (255, 255, 255),
                 2
             )
@@ -218,6 +246,17 @@ class VisionDebugger:
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.9,
                     (220, 220, 220),
+                    2
+                )
+
+            if field_label:
+                cv2.putText(
+                    full,
+                    f"Field: {field_label}",
+                    (20, 120),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.0,
+                    method_color,
                     2
                 )
 
@@ -252,6 +291,18 @@ class VisionDebugger:
                     0.9,
                     (255, 255, 255),
                     2
+                )
+
+            # Große Feldanzeige oben
+            if field_label:
+                cv2.putText(
+                    warp,
+                    field_label,
+                    (20, 85),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.2,
+                    method_color,
+                    3
                 )
 
             warp_hud = f"Cam {cam_id}"

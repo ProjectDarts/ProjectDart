@@ -4,11 +4,9 @@ import json
 import os
 import sys
 import time
+import threading
 
-from vision_absdiff import AbsDiffDetector
-from vision_takeout import TakeoutDetector
-from vision_vector import VectorDetector
-from vision_shape import ShapeDetector
+from vision_absdiff import AbsDiffDetector, fuse_three_cameras
 from vision_debug import VisionDebugger
 
 
@@ -45,9 +43,9 @@ class CameraHandler:
         self.compute_homography()
 
         self.cap = cv2.VideoCapture(cam_id, cv2.CAP_DSHOW)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-        time.sleep(1.5)
         self.cap.set(cv2.CAP_PROP_FPS, 30)
 
         self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
@@ -60,6 +58,16 @@ class CameraHandler:
             self.cap.set(cv2.CAP_PROP_BRIGHTNESS, 150)
 
         self.reference_gray = None
+
+        self.running = True
+        self.frame_lock = threading.Lock()
+        self.latest_frame = None
+        self.latest_ts = 0.0
+        self.frame_counter = 0
+        self.last_consumed_counter = -1
+
+        self.thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self.thread.start()
 
     def load_config(self):
         self.src_points = []
@@ -113,6 +121,51 @@ class CameraHandler:
             return None
         return cv2.warpPerspective(frame_bgr, self.H, (size, size))
 
+    def _reader_loop(self):
+        fail_count = 0
+        while self.running:
+            try:
+                ret, frame = self.cap.read()
+                if ret and frame is not None:
+                    with self.frame_lock:
+                        self.latest_frame = frame
+                        self.latest_ts = time.time()
+                        self.frame_counter += 1
+                    fail_count = 0
+                else:
+                    fail_count += 1
+                    if fail_count > 20:
+                        time.sleep(0.01)
+            except Exception:
+                fail_count += 1
+                time.sleep(0.01)
+
+    def get_latest_frame(self, only_new=False):
+        with self.frame_lock:
+            if self.latest_frame is None:
+                return None, None, None
+
+            if only_new and self.frame_counter == self.last_consumed_counter:
+                return None, None, None
+
+            frame = self.latest_frame.copy()
+            ts = self.latest_ts
+            counter = self.frame_counter
+            self.last_consumed_counter = counter
+            return frame, ts, counter
+
+    def stop(self):
+        self.running = False
+        try:
+            if self.thread.is_alive():
+                self.thread.join(timeout=0.5)
+        except Exception:
+            pass
+        try:
+            self.cap.release()
+        except Exception:
+            pass
+
 
 class DartVisionSystem:
     def __init__(self, hit_callback):
@@ -140,22 +193,12 @@ class DartVisionSystem:
             AbsDiffDetector(self.board_mask, self.FREEZE_MEAN, self.FREEZE_MAX)
             for _ in range(3)
         ]
-        self.shape_detectors = [
-            ShapeDetector(self.board_mask, self.FREEZE_MEAN, self.FREEZE_MAX)
-            for _ in range(3)
-        ]
-        self.vec_detectors = [
-            VectorDetector()
-            for _ in range(3)
-        ]
-        self.takeout_detectors = [
-            TakeoutDetector(self.board_mask)
-            for _ in range(3)
-        ]
 
         self.debugger = VisionDebugger(warp_size=800)
 
         self.running = True
+        self.console_debug = True
+
         self.last_hit_time = 0.0
         self.last_hit_board = None
         self.last_hit_contours = {}
@@ -165,24 +208,41 @@ class DartVisionSystem:
 
         self.WINKEL_OFFSET = 0
 
-        self.takeout_empty_frames = 0
-        self.takeout_empty_frames_required = 10
-        self.board_empty_state = True
+        self.hit_blocked_until = time.time() + 0.8
+        self.hit_cooldown_until = 0.0
 
-        self.hit_blocked_until = time.time() + 2.0
-        self.console_debug = True
+        self.pending_reference_update = False
+        self.pending_reference_started_at = 0.0
+        self.stable_frames = 0
+        self.required_stable_frames = 5
+
+        self.loop_idle_sleep = 0.0005
+        self.max_frame_age_sec = 0.20
+
+        self.max_fuse_pair_dist = 35.0
+
+        self.last_candidate_counts = [None, None, None]
+        self.last_cam_state = [None, None, None]
+        self.last_local_best_label = [None, None, None]
 
     def _dbg(self, msg):
         if self.console_debug:
             print(msg)
 
+    def _log_cam_error_once(self, idx, msg):
+        if self.last_cam_state[idx] != msg:
+            self.last_cam_state[idx] = msg
+            self._dbg(f"[CAM {idx}] {msg}")
+
     def _block_hits(self, seconds=1.0):
-        self.hit_blocked_until = max(self.hit_blocked_until, time.time() + seconds)
+        until = time.time() + seconds
+        self.hit_blocked_until = max(self.hit_blocked_until, until)
         self.hit_candidate = None
         self._dbg(f"[HIT BLOCK] Treffer gesperrt für {seconds:.2f}s bis {self.hit_blocked_until:.3f}")
 
     def _hits_allowed(self):
-        return time.time() >= self.hit_blocked_until
+        now = time.time()
+        return now >= self.hit_blocked_until and now >= self.hit_cooldown_until
 
     def run(self):
         print("[VISION] System bereit...")
@@ -190,94 +250,166 @@ class DartVisionSystem:
             self.reset_references()
 
             while self.running:
-                cam_hits = []
+                now = time.time()
                 board_is_moving = False
+                any_frame_processed = False
 
-                tracking_active = self.last_hit_board is not None
-                all_cameras_empty = tracking_active
+                warped_frames = [None, None, None]
+                raw_frames = [None, None, None]
+                cam_moving = [False, False, False]
+                cam_candidates = [[], [], []]
+                local_best = [None, None, None]
+                display_hits = [None, None, None]
 
                 for idx, cam in enumerate(self.cameras):
-                    ret, frame = cam.cap.read()
-                    if not ret or frame is None or cam.H is None:
+                    if cam.H is None:
+                        self._log_cam_error_once(idx, "KEIN_HOMOGRAPHY")
                         continue
+                    
+                    frame, frame_ts, _counter = cam.get_latest_frame(only_new=True)
+                    if frame is None:
+                        # normaler Fall: gerade noch kein neuer Frame da
+                        continue
+
+                    if frame_ts is not None and (now - frame_ts) > self.max_frame_age_sec:
+                        self._log_cam_error_once(idx, f"FRAME_TOO_OLD age={(now - frame_ts):.3f}s")
+                        continue
+
+                    # sobald wieder alles OK ist, Error-State zurücksetzen
+                    self.last_cam_state[idx] = None
+                    any_frame_processed = True
+                    raw_frames[idx] = frame
 
                     warped = cam.warp_to_board(frame, 600)
                     if warped is None:
+                        self._log_cam_state_once(idx, "WARP_FAILED")
                         continue
+                    warped_frames[idx] = warped
 
                     gray_warped = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
 
-                    cam_is_moving = False
                     if cam.reference_gray is not None:
                         diff_motion = cv2.absdiff(gray_warped, cam.reference_gray)
                         mean_val = float(cv2.mean(diff_motion)[0])
                         _, max_val, _, _ = cv2.minMaxLoc(diff_motion)
 
                         if mean_val > self.FREEZE_MEAN and max_val < self.FREEZE_MAX:
-                            cam_is_moving = True
+                            cam_moving[idx] = True
                             board_is_moving = True
                             self._dbg(
                                 f"[CAM {cam.cam_id}] BOARD_MOVING mean={mean_val:.2f} max={max_val:.2f}"
                             )
 
-                    if tracking_active:
-                        takeout_detected, _take_dbg = self.takeout_detectors[idx].check_takeout(
-                            warped, self.last_hit_contours
-                        )
-                        if not takeout_detected:
-                            all_cameras_empty = False
+                    candidates, _abs_dbg = self.abs_detectors[idx].detect_candidates(warped, gray_warped)
+                    cam_candidates[idx] = candidates
 
-                    abs_objs, _abs_dbg = self.abs_detectors[idx].detect(warped, gray_warped)
-                    shape_objs, _shape_dbg = self.shape_detectors[idx].detect(warped, gray_warped)
+                    cand_count = len(candidates)
+                    if self.last_candidate_counts[idx] != cand_count:
+                        self.last_candidate_counts[idx] = cand_count
+                        self._dbg(f"[CAM {cam.cam_id}] CANDIDATES abs={cand_count}")
 
-                    board_center_full = None
-                    if cam.invH is not None:
-                        board_center_full = pt_transform(cam.invH, (300.0, 300.0))
+                    local_best[idx] = self._pick_best_candidate(candidates, "abs")
 
-                    roi_mask_full = None
-                    if cam.invH is not None:
-                        full_h, full_w = frame.shape[:2]
-                        roi_mask_full = cv2.warpPerspective(self.board_mask, cam.invH, (full_w, full_h))
+                    if local_best[idx] is not None:
+                        bx, by = local_best[idx]["tip_board"]
+                        label = self._format_score_label(bx, by)
+                        summary = f"{label}@({bx:.1f},{by:.1f})"
+                        if self.last_local_best_label[idx] != summary:
+                            self.last_local_best_label[idx] = summary
+                            self._dbg(
+                                f"[CAM {cam.cam_id}] LOCAL best=({bx:.1f},{by:.1f}) "
+                                f"field={label} conf={local_best[idx]['confidence']:.1f}"
+                            )
+                    else:
+                        if self.last_local_best_label[idx] != "NONE":
+                            self.last_local_best_label[idx] = "NONE"
+                            self._dbg(f"[CAM {cam.cam_id}] LOCAL none")
 
-                    vec_objs_full = []
-                    if len(abs_objs) > 0:
-                        vec_objs_full = self.vec_detectors[idx].detect(
-                            frame_bgr=frame,
-                            board_center_full=board_center_full,
-                            board_roi_mask_full=roi_mask_full
-                        )
+                fused_hit = None
 
-                    vec_objs = []
-                    if cam.H is not None:
-                        for o in vec_objs_full:
-                            tip_full = o["tip"]
-                            tip_board = pt_transform(cam.H, tip_full)
-                            vec_objs.append({
-                                "tip_board": tip_board,
-                                "confidence": float(o.get("confidence", 0.0)),
-                                "contour": None,
-                                "extra": {
-                                    "line_full": o.get("line", None),
-                                    "length": float(o.get("length", 0.0))
-                                }
-                            })
+                if (
+                    self._hits_allowed()
+                    and not board_is_moving
+                    and all(warped_frames[i] is not None for i in range(3))
+                    and not any(cam_moving)
+                ):
+                    fused_hit = fuse_three_cameras(
+                        cam_candidates[0],
+                        cam_candidates[1],
+                        cam_candidates[2],
+                        max_pair_dist=self.max_fuse_pair_dist
+                    )
 
-                    if len(abs_objs) > 0 or len(shape_objs) > 0 or len(vec_objs) > 0:
+                    if fused_hit is not None and (now - self.last_hit_time > 0.12):
+                        final_x, final_y = fused_hit["tip_board"]
+
                         self._dbg(
-                            f"[CAM {cam.cam_id}] COUNTS abs={len(abs_objs)} shape={len(shape_objs)} vec={len(vec_objs)}"
+                            "[FUSION] "
+                            f"final=({final_x:.1f},{final_y:.1f}) "
+                            f"field={self._format_score_label(final_x, final_y)} "
+                            f"cluster_score={fused_hit['cluster_score']:.2f} "
+                            f"max_pair_dist={fused_hit['max_pair_dist']:.2f}"
                         )
 
-                    best = self._select_best(abs_objs, shape_objs, vec_objs)
+                        for cam_idx, cand in enumerate(fused_hit["per_camera"]):
+                            bx, by = cand["tip_board"]
+                            label = self._format_score_label(bx, by)
+                            display_hits[cam_idx] = {
+                                "tip_board": (bx, by),
+                                "confidence": float(cand["confidence"]),
+                                "method": f"abs | {label}"
+                            }
 
-                    if best is not None:
-                        bx, by = best["tip_board"]
+                            self._dbg(
+                                f"  [CAM {cam_idx}] tip=({bx:.1f},{by:.1f}) "
+                                f"field={label} conf={cand['confidence']:.1f} "
+                                f"side={cand.get('extra', {}).get('endpoint_side', '?')}"
+                            )
+
+                        current_point = (int(final_x), int(final_y))
+
+                        if self.hit_candidate is None:
+                            self.hit_candidate = current_point
+                            self.hit_candidate_time = now
+                            self._dbg(f"[HIT CAND START] point=({current_point[0]},{current_point[1]})")
+                        else:
+                            dist_prev = float(
+                                np.linalg.norm(np.array(current_point) - np.array(self.hit_candidate))
+                            )
+                            age = now - self.hit_candidate_time
+
+                            if dist_prev < 18 and age < 0.22:
+                                self.hit_candidate = None
+                                self._emit_score(current_point[0], current_point[1])
+                            else:
+                                self.hit_candidate = current_point
+                                self.hit_candidate_time = now
+                                self._dbg(
+                                    f"[HIT CAND UPDATE] point=({current_point[0]},{current_point[1]}) "
+                                    f"dist_prev={dist_prev:.1f}"
+                                )
+
+                for idx, cam in enumerate(self.cameras):
+                    frame = raw_frames[idx]
+                    if frame is None:
+                        continue
+
+                    shown = display_hits[idx]
+
+                    if shown is None and local_best[idx] is not None:
+                        bx, by = local_best[idx]["tip_board"]
+                        label = self._format_score_label(bx, by)
+                        shown = {
+                            "tip_board": (bx, by),
+                            "confidence": float(local_best[idx]["confidence"]),
+                            "method": f"{local_best[idx]['src']} | {label}"
+                        }
+
+                    if shown is not None:
+                        bx, by = shown["tip_board"]
                         tip_full = None
                         if cam.invH is not None:
                             tip_full = pt_transform(cam.invH, (bx, by))
-
-                        line_full = None
-                        if "vec" in best["src"]:
-                            line_full = best.get("extra", {}).get("line_full", None)
 
                         self.debugger.show(
                             cam_id=cam.cam_id,
@@ -285,26 +417,10 @@ class DartVisionSystem:
                             H_cam_to_board=cam.H,
                             tip_full=tip_full,
                             tip_board=(bx, by),
-                            line_full=line_full,
-                            method=best["src"],
-                            conf=float(best["confidence"])
+                            line_full=None,
+                            method=shown["method"],
+                            conf=float(shown["confidence"])
                         )
-
-                        if not cam_is_moving and self._hits_allowed() and (time.time() - self.last_hit_time > 0.35):
-                            if best.get("contour", None) is not None:
-                                self.last_hit_contours[cam.cam_id] = best["contour"]
-
-                            cam_hits.append({
-                                "cam_id": cam.cam_id,
-                                "tip_board": best["tip_board"],
-                                "confidence": float(best["confidence"]),
-                                "src": best["src"]
-                            })
-                            self._dbg(
-                                f"[CAM {cam.cam_id} -> HIT_CAND] src={best['src']} "
-                                f"tip=({best['tip_board'][0]:.1f},{best['tip_board'][1]:.1f}) "
-                                f"conf={float(best['confidence']):.1f}"
-                            )
                     else:
                         self.debugger.show(
                             cam_id=cam.cam_id,
@@ -319,54 +435,22 @@ class DartVisionSystem:
 
                 if board_is_moving:
                     self.hit_candidate = None
-                    self.takeout_empty_frames = 0
-                    time.sleep(0.01)
-                    continue
-
-                if tracking_active:
-                    if all_cameras_empty:
-                        self.takeout_empty_frames += 1
-                    else:
-                        self.takeout_empty_frames = 0
-                        self.board_empty_state = False
-
-                    if self.takeout_empty_frames >= self.takeout_empty_frames_required and not self.board_empty_state:
-                        print("[INFO] Alle Darts entfernt.")
-                        self.board_empty_state = True
-                        self.takeout_empty_frames = 0
-                        self.last_hit_board = None
-                        self.last_hit_contours = {}
-                        self.hit_candidate = None
-                        self.reset_references()
-                        self._block_hits(1.5)
-                        self.hit_callback("NEXT_PLAYER")
+                    self.stable_frames = 0
                 else:
-                    self.takeout_empty_frames = 0
-                    self.board_empty_state = True
+                    self.stable_frames += 1
 
-                if self._hits_allowed() and len(cam_hits) >= 2:
-                    fused = self._fuse_hits(cam_hits)
-                    if fused is not None:
-                        final_x, final_y, dist_ok = fused
-                        if dist_ok:
-                            current_point = (final_x, final_y)
-                            if self.hit_candidate is None:
-                                self.hit_candidate = current_point
-                                self.hit_candidate_time = time.time()
-                                self._dbg(f"[HIT CAND START] point=({final_x},{final_y})")
-                            else:
-                                dist_prev = float(np.linalg.norm(np.array(current_point) - np.array(self.hit_candidate)))
-                                if dist_prev < 18 and (time.time() - self.hit_candidate_time) < 0.25:
-                                    self.hit_candidate = None
-                                    self._emit_score(final_x, final_y)
-                                else:
-                                    self.hit_candidate = current_point
-                                    self.hit_candidate_time = time.time()
-                                    self._dbg(
-                                        f"[HIT CAND UPDATE] point=({final_x},{final_y}) dist_prev={dist_prev:.1f}"
-                                    )
+                if self.pending_reference_update:
+                    enough_stable = self.stable_frames >= self.required_stable_frames
+                    min_wait_done = (now - self.pending_reference_started_at) >= 0.05
+                    if enough_stable and min_wait_done:
+                        self.update_references_fast()
+                        self.pending_reference_update = False
+                        self._dbg("[REFRESH] Referenzen aktualisiert")
 
-                time.sleep(0.001)
+                if not any_frame_processed:
+                    time.sleep(0.002)
+                else:
+                    time.sleep(self.loop_idle_sleep)
 
         except Exception as e:
             print(f"[VISION ERROR] {e}")
@@ -375,7 +459,7 @@ class DartVisionSystem:
         self.running = False
         for cam in self.cameras:
             try:
-                cam.cap.release()
+                cam.stop()
             except Exception:
                 pass
         try:
@@ -389,48 +473,77 @@ class DartVisionSystem:
 
     def reset_references(self):
         self._dbg("[RESET REFERENCES] Starte Neuaufnahme der Referenzen")
+
+        start = time.time()
+        while time.time() - start < 0.3:
+            all_ready = True
+            for cam in self.cameras:
+                frame, _, _ = cam.get_latest_frame(only_new=False)
+                if frame is None:
+                    all_ready = False
+                    break
+            if all_ready:
+                break
+            time.sleep(0.01)
+
         for idx, cam in enumerate(self.cameras):
             cam.load_config()
             cam.compute_homography()
+
             if cam.H is None:
+                self._dbg(f"[RESET REFERENCES] Cam {cam.cam_id} übersprungen: H=None / config ungültig")
                 continue
 
-            for _ in range(12):
-                cam.cap.read()
+            frame, _, _ = cam.get_latest_frame(only_new=False)
+            if frame is None:
+                self._dbg(f"[RESET REFERENCES] Cam {cam.cam_id} übersprungen: kein Frame")
+                continue
 
-            ret, frame = cam.cap.read()
-            if ret and frame is not None:
-                warped = cam.warp_to_board(frame, 600)
-                if warped is not None:
-                    gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-                    self.abs_detectors[idx].set_reference(warped)
-                    self.shape_detectors[idx].set_reference(warped)
-                    self.takeout_detectors[idx].set_clean_board(warped)
-                    cam.reference_gray = gray
-                    self._dbg(f"[RESET REFERENCES] Cam {cam.cam_id} Referenzen gesetzt")
+            warped = cam.warp_to_board(frame, 600)
+            if warped is None:
+                self._dbg(f"[RESET REFERENCES] Cam {cam.cam_id} übersprungen: warp fehlgeschlagen")
+                continue
 
-        self._block_hits(2.0)
+            gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+            self.abs_detectors[idx].set_reference(warped)
+            cam.reference_gray = gray
+            self.last_candidate_counts[idx] = None
+            self.last_cam_state[idx] = None
+            self.last_local_best_label[idx] = None
+            self._dbg(f"[RESET REFERENCES] Cam {cam.cam_id} Referenzen gesetzt")
 
-    def update_references(self):
+        self.pending_reference_update = False
+        self.stable_frames = 0
+        self._block_hits(0.5)
+
+    def update_references_fast(self):
         for idx, cam in enumerate(self.cameras):
             if cam.H is None:
                 continue
 
-            for _ in range(8):
-                cam.cap.read()
+            frame, _, _ = cam.get_latest_frame(only_new=False)
+            if frame is None:
+                continue
 
-            ret, frame = cam.cap.read()
-            if ret and frame is not None:
-                warped = cam.warp_to_board(frame, 600)
-                if warped is not None:
-                    gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-                    self.abs_detectors[idx].set_reference(warped)
-                    self.shape_detectors[idx].set_reference(warped)
-                    cam.reference_gray = gray
+            warped = cam.warp_to_board(frame, 600)
+            if warped is None:
+                continue
 
-        self._block_hits(0.8)
+            gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+            self.abs_detectors[idx].set_reference(warped)
+            cam.reference_gray = gray
+            self.last_candidate_counts[idx] = None
+            self.last_local_best_label[idx] = None
 
-    def _pick_best_obj(self, objs, source_name, conf_scale=1.0):
+        self.stable_frames = 0
+        self._block_hits(0.10)
+
+    def _schedule_reference_update(self):
+        self.pending_reference_update = True
+        self.pending_reference_started_at = time.time()
+        self.stable_frames = 0
+
+    def _pick_best_candidate(self, objs, source_name, conf_scale=1.0):
         if not objs:
             return None
 
@@ -443,80 +556,25 @@ class DartVisionSystem:
             "extra": best.get("extra", {})
         }
 
-    def _select_best(self, abs_objs, shape_objs, vec_objs):
-        cands = []
+    def _format_score_label(self, x, y):
+        s = self._score_from_board(x, y)
 
-        best_abs = self._pick_best_obj(abs_objs, "abs", 1.0)
-        best_shape = self._pick_best_obj(shape_objs, "shape", 1.0)
-        best_vec = self._pick_best_obj(vec_objs, "vec", 0.45)
+        if s.get("is_missed", False):
+            return "Miss"
 
-        if best_abs is not None:
-            cands.append(best_abs)
-            abs_pt = np.array(best_abs["tip_board"])
+        ring = s.get("ring", "single")
+        sector = s.get("sector", 0)
 
-            if best_shape is not None:
-                if np.linalg.norm(abs_pt - np.array(best_shape["tip_board"])) < 35.0:
-                    cands.append(best_shape)
+        if ring == "bull":
+            return "Bull"
+        if ring == "single_bull":
+            return "25"
+        if ring == "double":
+            return f"Double {sector}"
+        if ring == "triple":
+            return f"Triple {sector}"
 
-            if best_vec is not None:
-                if np.linalg.norm(abs_pt - np.array(best_vec["tip_board"])) < 35.0:
-                    cands.append(best_vec)
-        else:
-            return None
-
-        return self._fuse_local_candidates(cands, merge_dist=25.0)
-
-    def _fuse_local_candidates(self, cands, merge_dist=20.0):
-        if not cands:
-            return None
-        if len(cands) == 1:
-            return cands[0]
-
-        weights = np.array([g["confidence"] for g in cands], dtype=np.float32)
-        pts = np.array([g["tip_board"] for g in cands], dtype=np.float32)
-        fused = np.average(pts, axis=0, weights=weights)
-
-        base_contour = None
-        base_extra = {}
-        for c in cands:
-            if c["src"] == "abs":
-                base_contour = c.get("contour", None)
-                base_extra = c.get("extra", {})
-                break
-
-        return {
-            "src": "+".join(sorted(set(g["src"] for g in cands))),
-            "tip_board": (float(fused[0]), float(fused[1])),
-            "confidence": float(np.sum(weights)),
-            "contour": base_contour,
-            "extra": base_extra
-        }
-
-    def _fuse_hits(self, cam_hits):
-        cam_hits = sorted(cam_hits, key=lambda d: d["confidence"], reverse=True)
-        if len(cam_hits) < 2:
-            return None
-
-        p1, p2 = np.array(cam_hits[0]["tip_board"]), np.array(cam_hits[1]["tip_board"])
-        dist = float(np.linalg.norm(p1 - p2))
-        dist_ok = dist < 65
-
-        weights = np.array([h["confidence"] for h in cam_hits[:3]], dtype=np.float32)
-        pts = np.array([h["tip_board"] for h in cam_hits[:3]], dtype=np.float32)
-        final = np.average(pts, axis=0, weights=weights)
-
-        self._dbg(
-            "[FUSION] "
-            + " | ".join(
-                [
-                    f"cam={h['cam_id']} src={h['src']} tip=({h['tip_board'][0]:.1f},{h['tip_board'][1]:.1f}) conf={h['confidence']:.1f}"
-                    for h in cam_hits[:3]
-                ]
-            )
-            + f" || final=({final[0]:.1f},{final[1]:.1f}) dist12={dist:.1f} dist_ok={dist_ok}"
-        )
-
-        return (int(final[0]), int(final[1]), dist_ok)
+        return f"Single {sector}"
 
     def _emit_score(self, bx, by):
         if self.last_hit_board is not None:
@@ -527,8 +585,6 @@ class DartVisionSystem:
         score_dict = self._score_from_board(bx, by)
         self.last_hit_board = (bx, by)
         self.last_hit_time = time.time()
-        self.board_empty_state = False
-        self.takeout_empty_frames = 0
 
         self._dbg(
             f"[EMIT] board=({bx:.1f},{by:.1f}) sector={score_dict.get('sector')} ring={score_dict.get('ring', '-')}"
@@ -536,8 +592,9 @@ class DartVisionSystem:
 
         self.hit_callback(score_dict)
 
-        time.sleep(0.35)
-        self.update_references()
+        self.hit_candidate = None
+        self.hit_cooldown_until = time.time() + 0.20
+        self._schedule_reference_update()
 
     def _score_from_board(self, x, y):
         rel_x, rel_y = x - 300, y - 300
