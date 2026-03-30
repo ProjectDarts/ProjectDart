@@ -6,7 +6,7 @@ import configparser
 
 
 def get_external_path(filename):
-    if getattr(sys, 'frozen', False):
+    if getattr(sys, "frozen", False):
         base_path = os.path.dirname(sys.executable)
     else:
         base_path = os.path.dirname(os.path.abspath(__file__))
@@ -28,7 +28,18 @@ class VisionDebugger:
     """
 
     def __init__(self, warp_size=800):
-        self.enabled, self.warp_size, self.show_full, self.show_warp = self._read_ini(warp_size)
+        (
+            self.enabled,
+            self.warp_size,
+            self.show_full,
+            self.show_warp,
+            self.full_window_w,
+            self.full_window_h,
+            self.warp_window_w,
+            self.warp_window_h,
+            self.window_topmost,
+        ) = self._read_ini(warp_size)
+
         self._windows_created = set()
 
     def _read_ini(self, fallback_warp_size):
@@ -40,6 +51,14 @@ class VisionDebugger:
         show_full = True
         show_warp = True
 
+        # feste sinnvolle Fenstergrößen
+        full_window_w = 1280
+        full_window_h = 720
+        warp_window_w = 1200
+        warp_window_h = 1200
+
+        window_topmost = False
+
         if os.path.exists(ini_path):
             cfg.read(ini_path, encoding="utf-8")
             enabled = int(cfg.get("vision", "debugging", fallback="1").strip()) == 1
@@ -47,7 +66,24 @@ class VisionDebugger:
             show_full = int(cfg.get("vision", "show_full", fallback="1").strip()) == 1
             show_warp = int(cfg.get("vision", "show_warp", fallback="1").strip()) == 1
 
-        return enabled, warp_size, show_full, show_warp
+            full_window_w = int(cfg.get("vision", "full_window_w", fallback="1280").strip())
+            full_window_h = int(cfg.get("vision", "full_window_h", fallback="720").strip())
+            warp_window_w = int(cfg.get("vision", "warp_window_w", fallback="1200").strip())
+            warp_window_h = int(cfg.get("vision", "warp_window_h", fallback="1200").strip())
+
+            window_topmost = int(cfg.get("vision", "window_topmost", fallback="0").strip()) == 1
+
+        return (
+            enabled,
+            warp_size,
+            show_full,
+            show_warp,
+            full_window_w,
+            full_window_h,
+            warp_window_w,
+            warp_window_h,
+            window_topmost,
+        )
 
     def _ensure_windows(self, cam_id):
         if not self.enabled:
@@ -57,54 +93,82 @@ class VisionDebugger:
             name = f"Cam {cam_id} - FULL"
             if name not in self._windows_created:
                 cv2.namedWindow(name, cv2.WINDOW_NORMAL)
+                cv2.resizeWindow(name, self.full_window_w, self.full_window_h)
+                if self.window_topmost:
+                    try:
+                        cv2.setWindowProperty(name, cv2.WND_PROP_TOPMOST, 1)
+                    except Exception:
+                        pass
                 self._windows_created.add(name)
 
         if self.show_warp:
             name = f"Cam {cam_id} - WARP"
             if name not in self._windows_created:
                 cv2.namedWindow(name, cv2.WINDOW_NORMAL)
+                cv2.resizeWindow(name, self.warp_window_w, self.warp_window_h)
+                if self.window_topmost:
+                    try:
+                        cv2.setWindowProperty(name, cv2.WND_PROP_TOPMOST, 1)
+                    except Exception:
+                        pass
                 self._windows_created.add(name)
 
     def _get_method_color(self, method):
-        """
-        OpenCV nutzt BGR.
-        """
         if method is None:
-            return (255, 255, 255)  # weiß
+            return (255, 255, 255)
 
         m = str(method).lower().strip()
 
-        # kombinierte Methoden / Fusion
         if "+" in m or "fusion" in m:
             return (255, 255, 0)  # cyan
-
         if m == "abs":
-            return (0, 0, 255)  # rot
+            return (0, 0, 255)    # rot
         if m == "vec":
             return (0, 255, 255)  # gelb
         if m == "shape":
             return (255, 0, 255)  # magenta
 
-        return (255, 255, 255)  # fallback weiß
+        return (255, 255, 255)
 
     def _draw_tip_marker(self, img, x, y, color, inner_radius=8, outer_radius=16):
         cv2.circle(img, (int(x), int(y)), inner_radius, color, -1)
         cv2.circle(img, (int(x), int(y)), outer_radius, color, 2)
 
-    def show(self, cam_id, frame_bgr, H_cam_to_board,
-             tip_full=None, tip_board=None, line_full=None,
-             method=None, conf=None, extra_lines=None):
+    def _fit_to_canvas(self, img, canvas_w, canvas_h, pad=20):
         """
-        cam_id: int
-        frame_bgr: Full frame (z.B. 1920x1080)
-        H_cam_to_board: Homography (Full -> 600x600 Boardspace)
-        tip_full: (x,y) im Full Frame
-        tip_board: (bx,by) im Boardspace (600x600)
-        line_full: (x1,y1,x2,y2) optional (z.B. aus Vector)
-        method: optional string ("abs", "vec", "shape", "abs+shape", ...)
-        conf: optional float
-        extra_lines: optional list[(x1,y1,x2,y2)] für mehrere Linien
+        Bild proportional in feste Zielgröße einpassen und mittig platzieren.
         """
+        h, w = img.shape[:2]
+
+        usable_w = max(1, canvas_w - 2 * pad)
+        usable_h = max(1, canvas_h - 2 * pad)
+
+        scale = min(usable_w / w, usable_h / h)
+        new_w = max(1, int(w * scale))
+        new_h = max(1, int(h * scale))
+
+        resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+        canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+
+        x_off = (canvas_w - new_w) // 2
+        y_off = (canvas_h - new_h) // 2
+
+        canvas[y_off:y_off + new_h, x_off:x_off + new_w] = resized
+        return canvas
+
+    def show(
+        self,
+        cam_id,
+        frame_bgr,
+        H_cam_to_board,
+        tip_full=None,
+        tip_board=None,
+        line_full=None,
+        method=None,
+        conf=None,
+        extra_lines=None,
+    ):
         if not self.enabled:
             return
 
@@ -115,12 +179,10 @@ class VisionDebugger:
         if self.show_full:
             full = frame_bgr.copy()
 
-            # optionale Hauptlinie (typisch Vector)
             if line_full is not None:
                 x1, y1, x2, y2 = line_full
                 cv2.line(full, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 255), 2)
 
-            # optionale Zusatzlinien
             if extra_lines:
                 for l in extra_lines:
                     if l is None:
@@ -128,12 +190,10 @@ class VisionDebugger:
                     x1, y1, x2, y2 = l
                     cv2.line(full, (int(x1), int(y1)), (int(x2), int(y2)), (255, 200, 0), 1)
 
-            # Tip markieren
             if tip_full is not None:
                 tx, ty = tip_full
                 self._draw_tip_marker(full, tx, ty, method_color, inner_radius=8, outer_radius=16)
 
-            # HUD
             hud = f"Cam {cam_id}"
             if method:
                 hud += f" | {method}"
@@ -161,17 +221,22 @@ class VisionDebugger:
                     2
                 )
 
-            cv2.imshow(f"Cam {cam_id} - FULL", full)
+            full_display = self._fit_to_canvas(
+                full,
+                self.full_window_w,
+                self.full_window_h,
+                pad=20
+            )
+
+            cv2.imshow(f"Cam {cam_id} - FULL", full_display)
 
         # ---------- WARP / BOARD SPACE ----------
         if self.show_warp and H_cam_to_board is not None:
             warp = cv2.warpPerspective(frame_bgr, H_cam_to_board, (self.warp_size, self.warp_size))
 
-            # Boardcenter markieren
             c = self.warp_size // 2
             cv2.circle(warp, (c, c), 4, (255, 255, 255), -1)
 
-            # Tip in Boardspace (600) -> auf warp_size skalieren
             if tip_board is not None:
                 bx, by = tip_board
                 sx = int((bx / 600.0) * self.warp_size)
@@ -189,7 +254,6 @@ class VisionDebugger:
                     2
                 )
 
-            # HUD im Warp
             warp_hud = f"Cam {cam_id}"
             if method:
                 warp_hud += f" | {method}"
@@ -206,7 +270,14 @@ class VisionDebugger:
                 2
             )
 
-            cv2.imshow(f"Cam {cam_id} - WARP", warp)
+            warp_display = self._fit_to_canvas(
+                warp,
+                self.warp_window_w,
+                self.warp_window_h,
+                pad=40
+            )
+
+            cv2.imshow(f"Cam {cam_id} - WARP", warp_display)
 
         cv2.waitKey(1)
 
