@@ -1,47 +1,45 @@
 import cv2
 import numpy as np
-from itertools import product
 
 
 class AbsDiffDetector:
     """
-    AbsDiff Detector im Boardspace (warped 600x600):
-    Liefert pro Kamera mehrere plausible Tip-Kandidaten.
+    AbsDiff Detector im Boardspace (warped 600x600).
 
-    detect_candidates(warped_bgr, gray_optional) ->
-        candidates, dbg, reject_stats
+    Hauptziel:
+    - stabile Änderungsmaske im Warped-Bild erzeugen
+    - optionale lokale Kandidaten für Debug ableiten
 
-    candidate:
-        {
-          "tip_board": (x, y),
-          "confidence": float,
-          "contour": cnt,
-          "extra": {...}
-        }
+    detect_mask_candidates(...) -> {
+        "mask": thr,
+        "dbg": dbg,
+        "candidates": [...],
+        "reject_stats": {...},
+        "meta": {...}
+    }
     """
 
     def __init__(self, board_mask, freeze_mean=20, freeze_max=70):
         self.board_mask = board_mask
-        self.reference_frame = None  # gray
+        self.reference_frame = None
 
         self.FREEZE_MEAN = float(freeze_mean)
         self.FREEZE_MAX = float(freeze_max)
 
-        # Toleranter als vorher, damit Cam 2 eher Kandidaten liefert
-        self.min_area = 200
-        self.max_area = 16000
-        self.min_length = 18
-        self.merge_dist = 22
+        # etwas toleranter
+        self.min_area = 160
+        self.max_area = 18000
+        self.min_length = 12
+        self.merge_dist = 20
 
         self.min_diff_threshold = 18
 
         kernel_mask = np.ones((9, 9), np.uint8)
         self.inner_board_mask = cv2.erode(self.board_mask, kernel_mask, iterations=1)
 
-        # gelockerte Formfilter
-        self.max_width = 40.0
-        self.min_slenderness = 1.6
-        self.min_aspect = 1.15
+        self.max_width = 52.0
+        self.min_slenderness = 1.2
+        self.min_aspect = 1.02
 
     def _prepare_gray(self, frame_bgr):
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
@@ -53,10 +51,10 @@ class AbsDiffDetector:
 
     def detect(self, warped_frame_bgr, gray=None):
         """
-        Kompatibilität für alten Code.
+        Kompatibilität zu altem Code.
         """
-        candidates, dbg, _reject_stats = self.detect_candidates(warped_frame_bgr, gray=gray)
-        return candidates, dbg
+        result = self.detect_mask_candidates(warped_frame_bgr, gray=gray)
+        return result["candidates"], result["dbg"]
 
     def _build_threshold_mask(self, warped_frame_bgr, gray=None):
         if self.reference_frame is None:
@@ -68,7 +66,6 @@ class AbsDiffDetector:
             gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
         diff = cv2.absdiff(self.reference_frame, gray)
-
         diff_masked = cv2.bitwise_and(diff, self.inner_board_mask)
 
         mask_pixels = diff_masked[self.inner_board_mask > 0]
@@ -78,6 +75,7 @@ class AbsDiffDetector:
         mean_val = float(np.mean(mask_pixels))
         max_val = float(np.max(mask_pixels))
 
+        # globales leichtes Wackeln ignorieren
         if mean_val > self.FREEZE_MEAN and max_val < self.FREEZE_MAX:
             return None, None, {
                 "reason": "freeze",
@@ -100,13 +98,13 @@ class AbsDiffDetector:
 
         white_ratio = cv2.countNonZero(thr) / mask_nonzero
 
-        if white_ratio < 0.00015:
+        if white_ratio < 0.00008:
             return None, None, {
                 "reason": "too_small",
                 "white_ratio": white_ratio,
             }
 
-        if white_ratio > 0.08:
+        if white_ratio > 0.12:
             return None, None, {
                 "reason": "too_large",
                 "white_ratio": white_ratio,
@@ -118,6 +116,10 @@ class AbsDiffDetector:
         thr = cv2.morphologyEx(thr, cv2.MORPH_OPEN, kernel_open, iterations=1)
         thr = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, kernel_close, iterations=1)
 
+        # minimal erweitern, damit dünne Dart-Anteile nicht abbrechen
+        kernel_dilate = np.ones((3, 3), np.uint8)
+        thr = cv2.dilate(thr, kernel_dilate, iterations=1)
+
         thr = cv2.bitwise_and(thr, self.inner_board_mask)
 
         meta = {
@@ -128,8 +130,8 @@ class AbsDiffDetector:
         }
         return thr, diff_masked, meta
 
-    def detect_candidates(self, warped_frame_bgr, gray=None):
-        thr, _, meta = self._build_threshold_mask(warped_frame_bgr, gray=gray)
+    def detect_mask_candidates(self, warped_frame_bgr, gray=None):
+        thr, _diff_masked, meta = self._build_threshold_mask(warped_frame_bgr, gray=gray)
         dbg = warped_frame_bgr.copy()
 
         reject_stats = {
@@ -142,10 +144,15 @@ class AbsDiffDetector:
         }
 
         if thr is None:
-            return [], dbg, reject_stats
+            return {
+                "mask": None,
+                "dbg": dbg,
+                "candidates": [],
+                "reject_stats": reject_stats,
+                "meta": meta,
+            }
 
         contours, _ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
         raw_candidates = []
 
         for cnt in contours:
@@ -202,39 +209,34 @@ class AbsDiffDetector:
             tip_a = np.mean(pts[idxs_min], axis=0)
             tip_b = np.mean(pts[idxs_max], axis=0)
 
-            dist_a = float(np.linalg.norm(tip_a - center))
-            dist_b = float(np.linalg.norm(tip_b - center))
-
-            conf_a = float(base_conf * (1.0 + 0.02 * dist_a))
-            conf_b = float(base_conf * (1.0 + 0.02 * dist_b))
-
-            extra_common = {
-                "area": area,
-                "length": length,
-                "width": width,
-                "slenderness": slenderness,
-                "aspect": aspect,
-                "threshold": meta["threshold"],
-                "white_ratio": meta["white_ratio"],
-                "center": (float(center[0]), float(center[1])),
-            }
-
             raw_candidates.append({
                 "tip_board": (float(tip_a[0]), float(tip_a[1])),
-                "confidence": conf_a,
+                "confidence": float(base_conf),
                 "contour": cnt,
                 "extra": {
-                    **extra_common,
+                    "area": area,
+                    "length": length,
+                    "width": width,
+                    "slenderness": slenderness,
+                    "aspect": aspect,
+                    "threshold": meta.get("threshold", None),
+                    "white_ratio": meta.get("white_ratio", None),
                     "endpoint_side": "min_proj",
                 }
             })
 
             raw_candidates.append({
                 "tip_board": (float(tip_b[0]), float(tip_b[1])),
-                "confidence": conf_b,
+                "confidence": float(base_conf),
                 "contour": cnt,
                 "extra": {
-                    **extra_common,
+                    "area": area,
+                    "length": length,
+                    "width": width,
+                    "slenderness": slenderness,
+                    "aspect": aspect,
+                    "threshold": meta.get("threshold", None),
+                    "white_ratio": meta.get("white_ratio", None),
                     "endpoint_side": "max_proj",
                 }
             })
@@ -257,51 +259,98 @@ class AbsDiffDetector:
             tx, ty = o["tip_board"]
             cv2.circle(dbg, (int(tx), int(ty)), 4, (0, 0, 255), -1)
 
-        return merged, dbg, reject_stats
+        return {
+            "mask": thr,
+            "dbg": dbg,
+            "candidates": merged,
+            "reject_stats": reject_stats,
+            "meta": meta,
+        }
 
 
-def _pairwise_cluster_score(points):
-    d01 = float(np.linalg.norm(points[0] - points[1]))
-    d02 = float(np.linalg.norm(points[0] - points[2]))
-    d12 = float(np.linalg.norm(points[1] - points[2]))
-    return d01 + d02 + d12 + max(d01, d02, d12), (d01, d02, d12)
-
-
-def fuse_three_cameras(cands_cam0, cands_cam1, cands_cam2, max_pair_dist=35.0):
-    if not cands_cam0 or not cands_cam1 or not cands_cam2:
+def _build_distance_map_from_mask(mask):
+    """
+    Abstand jedes Pixels zum nächsten aktiven Maskenpixel.
+    mask: 255 = Änderung, 0 = kein Treffer
+    """
+    if mask is None or cv2.countNonZero(mask) == 0:
         return None
 
-    best = None
-    best_score = float("inf")
+    inv = np.where(mask > 0, 0, 255).astype(np.uint8)
+    dist = cv2.distanceTransform(inv, cv2.DIST_L2, 3)
+    return dist
 
-    top0 = sorted(cands_cam0, key=lambda c: c["confidence"], reverse=True)[:8]
-    top1 = sorted(cands_cam1, key=lambda c: c["confidence"], reverse=True)[:8]
-    top2 = sorted(cands_cam2, key=lambda c: c["confidence"], reverse=True)[:8]
 
-    for c0, c1, c2 in product(top0, top1, top2):
-        p0 = np.array(c0["tip_board"], dtype=np.float32)
-        p1 = np.array(c1["tip_board"], dtype=np.float32)
-        p2 = np.array(c2["tip_board"], dtype=np.float32)
+def fuse_warped_masks(mask_list, board_mask, max_dist=22.0):
+    """
+    Sucht direkt im Warped-Bild den Punkt, der zu den Änderungsmasken
+    aller verfügbaren Kameras den kleinsten Abstand hat.
 
-        score, dists = _pairwise_cluster_score([p0, p1, p2])
-        worst_dist = max(dists)
+    Das ist die finale Tip-Bestimmung.
 
-        if worst_dist > max_pair_dist:
+    Rückgabe:
+      {
+        "tip_board": (x, y),
+        "per_cam_dist": [...],
+        "used_cams": [...],
+        "score": float,
+        "max_dist": float
+      }
+    oder None
+    """
+    active = []
+    for idx, m in enumerate(mask_list):
+        if m is not None and cv2.countNonZero(m) > 0:
+            active.append((idx, m))
+
+    if len(active) < 2:
+        return None
+
+    dist_maps = []
+    used_cams = []
+
+    for idx, m in active:
+        d = _build_distance_map_from_mask(m)
+        if d is None:
             continue
+        dist_maps.append(d)
+        used_cams.append(idx)
 
-        conf_sum = c0["confidence"] + c1["confidence"] + c2["confidence"]
-        final_score = score - 0.002 * conf_sum
+    if len(dist_maps) < 2:
+        return None
 
-        if final_score < best_score:
-            best_score = final_score
-            fused = (p0 + p1 + p2) / 3.0
+    # Suchregion = Vereinigung der Änderungen, leicht erweitert
+    union = np.zeros_like(board_mask, dtype=np.uint8)
+    for _, m in active:
+        union = cv2.bitwise_or(union, m)
 
-            best = {
-                "tip_board": (float(fused[0]), float(fused[1])),
-                "per_camera": [c0, c1, c2],
-                "cluster_score": float(score),
-                "max_pair_dist": float(worst_dist),
-                "confidence": float(conf_sum),
-            }
+    kernel = np.ones((9, 9), np.uint8)
+    search_region = cv2.dilate(union, kernel, iterations=2)
+    search_region = cv2.bitwise_and(search_region, board_mask)
 
-    return best
+    ys, xs = np.where(search_region > 0)
+    if len(xs) == 0:
+        return None
+
+    stacked = np.stack(dist_maps, axis=0)  # [N, H, W]
+    vals = stacked[:, ys, xs]              # [N, P]
+
+    score = np.sum(vals, axis=0) + 0.75 * np.max(vals, axis=0)
+    best_idx = int(np.argmin(score))
+
+    bx = int(xs[best_idx])
+    by = int(ys[best_idx])
+
+    per_cam_dist = [float(stacked[i, by, bx]) for i in range(stacked.shape[0])]
+    worst = max(per_cam_dist)
+
+    if worst > max_dist:
+        return None
+
+    return {
+        "tip_board": (float(bx), float(by)),
+        "per_cam_dist": per_cam_dist,
+        "used_cams": used_cams,
+        "score": float(score[best_idx]),
+        "max_dist": float(worst),
+    }

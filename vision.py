@@ -6,7 +6,7 @@ import sys
 import time
 import threading
 
-from vision_absdiff import AbsDiffDetector, fuse_three_cameras
+from vision_absdiff import AbsDiffDetector, fuse_warped_masks
 from vision_debug import VisionDebugger
 
 
@@ -22,13 +22,6 @@ def pt_transform(H: np.ndarray, pt):
     p = np.array([[pt]], dtype=np.float32)
     out = cv2.perspectiveTransform(p, H)[0][0]
     return (float(out[0]), float(out[1]))
-
-
-def line_transform(H: np.ndarray, line):
-    x1, y1, x2, y2 = line
-    p1 = pt_transform(H, (x1, y1))
-    p2 = pt_transform(H, (x2, y2))
-    return (p1[0], p1[1], p2[0], p2[1])
 
 
 class CameraHandler:
@@ -194,6 +187,13 @@ class DartVisionSystem:
             for _ in range(3)
         ]
 
+        # Cam 2 etwas toleranter
+        self.abs_detectors[2].min_area = 120
+        self.abs_detectors[2].min_length = 10
+        self.abs_detectors[2].max_width = 60.0
+        self.abs_detectors[2].min_slenderness = 1.05
+        self.abs_detectors[2].min_aspect = 1.0
+
         self.debugger = VisionDebugger(warp_size=800)
 
         self.running = True
@@ -201,7 +201,6 @@ class DartVisionSystem:
 
         self.last_hit_time = 0.0
         self.last_hit_board = None
-        self.last_hit_contours = {}
 
         self.hit_candidate = None
         self.hit_candidate_time = 0.0
@@ -219,20 +218,16 @@ class DartVisionSystem:
         self.loop_idle_sleep = 0.0005
         self.max_frame_age_sec = 0.20
 
-        self.max_fuse_pair_dist = 35.0
-
         self.last_candidate_counts = [None, None, None]
-        self.last_cam_state = [None, None, None]
+        self.last_reject_log = [None, None, None]
         self.last_local_best_label = [None, None, None]
+        self.last_fusion_summary = None
+
+        self.mask_consensus_max_dist = 20.0
 
     def _dbg(self, msg):
         if self.console_debug:
             print(msg)
-
-    def _log_cam_error_once(self, idx, msg):
-        if self.last_cam_state[idx] != msg:
-            self.last_cam_state[idx] = msg
-            self._dbg(f"[CAM {idx}] {msg}")
 
     def _block_hits(self, seconds=1.0):
         until = time.time() + seconds
@@ -256,37 +251,33 @@ class DartVisionSystem:
 
                 warped_frames = [None, None, None]
                 raw_frames = [None, None, None]
+                gray_warped_frames = [None, None, None]
                 cam_moving = [False, False, False]
-                cam_candidates = [[], [], []]
-                local_best = [None, None, None]
-                display_hits = [None, None, None]
+
+                mask_results = [None, None, None]
+                mask_list = [None, None, None]
 
                 for idx, cam in enumerate(self.cameras):
                     if cam.H is None:
-                        self._log_cam_error_once(idx, "KEIN_HOMOGRAPHY")
                         continue
-                    
+
                     frame, frame_ts, _counter = cam.get_latest_frame(only_new=True)
                     if frame is None:
-                        # normaler Fall: gerade noch kein neuer Frame da
                         continue
 
                     if frame_ts is not None and (now - frame_ts) > self.max_frame_age_sec:
-                        self._log_cam_error_once(idx, f"FRAME_TOO_OLD age={(now - frame_ts):.3f}s")
                         continue
 
-                    # sobald wieder alles OK ist, Error-State zurücksetzen
-                    self.last_cam_state[idx] = None
                     any_frame_processed = True
                     raw_frames[idx] = frame
 
                     warped = cam.warp_to_board(frame, 600)
                     if warped is None:
-                        self._log_cam_state_once(idx, "WARP_FAILED")
                         continue
                     warped_frames[idx] = warped
 
                     gray_warped = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+                    gray_warped_frames[idx] = gray_warped
 
                     if cam.reference_gray is not None:
                         diff_motion = cv2.absdiff(gray_warped, cam.reference_gray)
@@ -296,29 +287,34 @@ class DartVisionSystem:
                         if mean_val > self.FREEZE_MEAN and max_val < self.FREEZE_MAX:
                             cam_moving[idx] = True
                             board_is_moving = True
-                            self._dbg(
-                                f"[CAM {cam.cam_id}] BOARD_MOVING mean={mean_val:.2f} max={max_val:.2f}"
-                            )
 
-                    candidates, _abs_dbg = self.abs_detectors[idx].detect_candidates(warped, gray_warped)
-                    cam_candidates[idx] = candidates
+                    result = self.abs_detectors[idx].detect_mask_candidates(warped, gray_warped)
+                    mask_results[idx] = result
+                    mask_list[idx] = result["mask"]
 
-                    cand_count = len(candidates)
+                    cand_count = len(result["candidates"])
                     if self.last_candidate_counts[idx] != cand_count:
                         self.last_candidate_counts[idx] = cand_count
                         self._dbg(f"[CAM {cam.cam_id}] CANDIDATES abs={cand_count}")
 
-                    local_best[idx] = self._pick_best_candidate(candidates, "abs")
+                    if cand_count == 0:
+                        reject_key = tuple(sorted(result["reject_stats"].items()))
+                        if self.last_reject_log[idx] != reject_key:
+                            self.last_reject_log[idx] = reject_key
+                            self._dbg(f"[CAM {cam.cam_id}] REJECTS {result['reject_stats']}")
+                    else:
+                        self.last_reject_log[idx] = None
 
-                    if local_best[idx] is not None:
-                        bx, by = local_best[idx]["tip_board"]
+                    local_best = self._pick_best_candidate(result["candidates"], "abs")
+                    if local_best is not None:
+                        bx, by = local_best["tip_board"]
                         label = self._format_score_label(bx, by)
                         summary = f"{label}@({bx:.1f},{by:.1f})"
                         if self.last_local_best_label[idx] != summary:
                             self.last_local_best_label[idx] = summary
                             self._dbg(
                                 f"[CAM {cam.cam_id}] LOCAL best=({bx:.1f},{by:.1f}) "
-                                f"field={label} conf={local_best[idx]['confidence']:.1f}"
+                                f"field={label} conf={local_best['confidence']:.1f}"
                             )
                     else:
                         if self.last_local_best_label[idx] != "NONE":
@@ -327,43 +323,42 @@ class DartVisionSystem:
 
                 fused_hit = None
 
+                active_masks = sum(
+                    1 for m in mask_list if m is not None and cv2.countNonZero(m) > 0
+                )
+
                 if (
                     self._hits_allowed()
                     and not board_is_moving
-                    and all(warped_frames[i] is not None for i in range(3))
+                    and active_masks >= 2
                     and not any(cam_moving)
                 ):
-                    fused_hit = fuse_three_cameras(
-                        cam_candidates[0],
-                        cam_candidates[1],
-                        cam_candidates[2],
-                        max_pair_dist=self.max_fuse_pair_dist
+                    fused_hit = fuse_warped_masks(
+                        mask_list=mask_list,
+                        board_mask=self.board_mask,
+                        max_dist=self.mask_consensus_max_dist
                     )
 
                     if fused_hit is not None and (now - self.last_hit_time > 0.12):
                         final_x, final_y = fused_hit["tip_board"]
+                        final_label = self._format_score_label(final_x, final_y)
 
-                        self._dbg(
-                            "[FUSION] "
-                            f"final=({final_x:.1f},{final_y:.1f}) "
-                            f"field={self._format_score_label(final_x, final_y)} "
-                            f"cluster_score={fused_hit['cluster_score']:.2f} "
-                            f"max_pair_dist={fused_hit['max_pair_dist']:.2f}"
+                        fusion_summary = (
+                            round(final_x, 1),
+                            round(final_y, 1),
+                            final_label,
+                            tuple(fused_hit["used_cams"]),
+                            tuple(round(d, 1) for d in fused_hit["per_cam_dist"]),
                         )
-
-                        for cam_idx, cand in enumerate(fused_hit["per_camera"]):
-                            bx, by = cand["tip_board"]
-                            label = self._format_score_label(bx, by)
-                            display_hits[cam_idx] = {
-                                "tip_board": (bx, by),
-                                "confidence": float(cand["confidence"]),
-                                "method": f"abs | {label}"
-                            }
-
+                        if self.last_fusion_summary != fusion_summary:
+                            self.last_fusion_summary = fusion_summary
                             self._dbg(
-                                f"  [CAM {cam_idx}] tip=({bx:.1f},{by:.1f}) "
-                                f"field={label} conf={cand['confidence']:.1f} "
-                                f"side={cand.get('extra', {}).get('endpoint_side', '?')}"
+                                "[FUSION] "
+                                f"final=({final_x:.1f},{final_y:.1f}) "
+                                f"field={final_label} "
+                                f"used_cams={fused_hit['used_cams']} "
+                                f"per_cam_dist={[round(d, 2) for d in fused_hit['per_cam_dist']]} "
+                                f"score={fused_hit['score']:.2f}"
                             )
 
                         current_point = (int(final_x), int(final_y))
@@ -389,24 +384,35 @@ class DartVisionSystem:
                                     f"dist_prev={dist_prev:.1f}"
                                 )
 
+                # Debuganzeige:
+                # Wenn Fusion existiert -> denselben finalen Punkt in ALLEN Kameras anzeigen.
+                # Sonst lokaler Fallback.
                 for idx, cam in enumerate(self.cameras):
                     frame = raw_frames[idx]
                     if frame is None:
                         continue
 
-                    shown = display_hits[idx]
+                    shown_tip = None
+                    shown_method = None
+                    shown_conf = None
 
-                    if shown is None and local_best[idx] is not None:
-                        bx, by = local_best[idx]["tip_board"]
-                        label = self._format_score_label(bx, by)
-                        shown = {
-                            "tip_board": (bx, by),
-                            "confidence": float(local_best[idx]["confidence"]),
-                            "method": f"{local_best[idx]['src']} | {label}"
-                        }
+                    if fused_hit is not None:
+                        bx, by = fused_hit["tip_board"]
+                        shown_tip = (bx, by)
+                        shown_method = f"fusion | {self._format_score_label(bx, by)}"
+                        shown_conf = max(1.0, 10000.0 / max(1.0, fused_hit["score"]))
+                    else:
+                        result = mask_results[idx]
+                        if result is not None:
+                            local_best = self._pick_best_candidate(result["candidates"], "abs")
+                            if local_best is not None:
+                                bx, by = local_best["tip_board"]
+                                shown_tip = (bx, by)
+                                shown_method = f"abs | {self._format_score_label(bx, by)}"
+                                shown_conf = float(local_best["confidence"])
 
-                    if shown is not None:
-                        bx, by = shown["tip_board"]
+                    if shown_tip is not None:
+                        bx, by = shown_tip
                         tip_full = None
                         if cam.invH is not None:
                             tip_full = pt_transform(cam.invH, (bx, by))
@@ -418,8 +424,8 @@ class DartVisionSystem:
                             tip_full=tip_full,
                             tip_board=(bx, by),
                             line_full=None,
-                            method=shown["method"],
-                            conf=float(shown["confidence"])
+                            method=shown_method,
+                            conf=shown_conf
                         )
                     else:
                         self.debugger.show(
@@ -489,27 +495,25 @@ class DartVisionSystem:
         for idx, cam in enumerate(self.cameras):
             cam.load_config()
             cam.compute_homography()
-
             if cam.H is None:
-                self._dbg(f"[RESET REFERENCES] Cam {cam.cam_id} übersprungen: H=None / config ungültig")
                 continue
 
             frame, _, _ = cam.get_latest_frame(only_new=False)
             if frame is None:
-                self._dbg(f"[RESET REFERENCES] Cam {cam.cam_id} übersprungen: kein Frame")
                 continue
 
             warped = cam.warp_to_board(frame, 600)
             if warped is None:
-                self._dbg(f"[RESET REFERENCES] Cam {cam.cam_id} übersprungen: warp fehlgeschlagen")
                 continue
 
             gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
             self.abs_detectors[idx].set_reference(warped)
             cam.reference_gray = gray
+
             self.last_candidate_counts[idx] = None
-            self.last_cam_state[idx] = None
+            self.last_reject_log[idx] = None
             self.last_local_best_label[idx] = None
+
             self._dbg(f"[RESET REFERENCES] Cam {cam.cam_id} Referenzen gesetzt")
 
         self.pending_reference_update = False
@@ -532,7 +536,9 @@ class DartVisionSystem:
             gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
             self.abs_detectors[idx].set_reference(warped)
             cam.reference_gray = gray
+
             self.last_candidate_counts[idx] = None
+            self.last_reject_log[idx] = None
             self.last_local_best_label[idx] = None
 
         self.stable_frames = 0
