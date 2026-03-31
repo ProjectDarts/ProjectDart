@@ -6,96 +6,217 @@ import sys
 import time
 import threading
 
+# Modul zur Treffererkennung über Bilddifferenz
 from vision_absdiff import AbsDiffDetector, fuse_warped_masks
+
+# Modul für Debug-Fenster / Visualisierung
 from vision_debug import VisionDebugger
 
 
 def get_external_path(filename: str) -> str:
+    """
+    Liefert einen absoluten Pfad zu einer externen Datei.
+
+    Unterstützt zwei Betriebsarten:
+    1. Normale Python-Ausführung:
+       Pfad relativ zum Speicherort dieser .py-Datei
+    2. Kompilierte EXE (z. B. PyInstaller):
+       Pfad relativ zum Speicherort der ausführbaren Datei
+
+    Damit können Konfigurationsdateien zuverlässig gefunden werden,
+    unabhängig davon, ob das System als Script oder als EXE läuft.
+
+    Parameter:
+        filename:
+            Name oder relativer Pfad der Datei
+
+    Rückgabe:
+        Absoluter Dateipfad
+    """
     if getattr(sys, 'frozen', False):
         base_path = os.path.dirname(sys.executable)
     else:
         base_path = os.path.dirname(os.path.abspath(__file__))
+
     return os.path.join(base_path, filename)
 
 
 def pt_transform(H: np.ndarray, pt):
+    """
+    Transformiert einen einzelnen 2D-Punkt mit einer Homographie-Matrix.
+
+    Diese Funktion wird hauptsächlich für die Debuganzeige genutzt:
+    Ein Punkt in Board-Koordinaten kann damit zurück in das jeweilige
+    Kamerabild projiziert werden.
+
+    Parameter:
+        H:
+            3x3-Homographie-Matrix
+        pt:
+            Punkt als (x, y)
+
+    Rückgabe:
+        Transformierter Punkt als Tupel (x, y) mit float-Werten
+    """
     p = np.array([[pt]], dtype=np.float32)
     out = cv2.perspectiveTransform(p, H)[0][0]
     return (float(out[0]), float(out[1]))
 
 
 class CameraHandler:
+    """
+    Verwaltet eine einzelne Kamera inklusive:
+
+    - Laden der Kamerakonfiguration
+    - Berechnung der Homographie
+    - Öffnen und Konfigurieren der Kamera
+    - permanentes Einlesen der Frames in einem Hintergrund-Thread
+    - thread-sicheres Bereitstellen des neuesten Frames
+    """
+
     def __init__(self, cam_id: int):
+        """
+        Initialisiert eine Kamera mit ihrer ID.
+
+        Parameter:
+            cam_id:
+                OpenCV-Kameraindex, z. B. 0, 1, 2
+        """
         self.cam_id = cam_id
+
+        # Pfad zur kameraspezifischen JSON-Konfiguration
         self.config_file = get_external_path(f"cam{cam_id}_config.json")
+
+        # Die vier Quellpunkte der Kalibrierung im Kamerabild
         self.src_points = []
+
+        # Homographie Kamera -> Board
         self.H = None
+
+        # Inverse Homographie Board -> Kamera
         self.invH = None
 
+        # Kalibrierung laden und Transformationsmatrizen berechnen
         self.load_config()
         self.compute_homography()
 
+        # Kamera öffnen
         self.cap = cv2.VideoCapture(cam_id, cv2.CAP_DSHOW)
+
+        # Buffer klein halten, damit möglichst aktuelle Frames verarbeitet werden
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        # Feste Zielauflösung
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+
+        # Ziel-FPS
         self.cap.set(cv2.CAP_PROP_FPS, 30)
 
+        # Manuelle Belichtungssteuerung
         self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
         self.cap.set(cv2.CAP_PROP_EXPOSURE, -7)
         self.cap.set(cv2.CAP_PROP_GAIN, 10)
 
+        # Kameraspezifische Helligkeit
+        # Cam 2 wird offenbar anders behandelt als Cam 0/1
         if self.cam_id == 2:
             self.cap.set(cv2.CAP_PROP_BRIGHTNESS, 100)
         else:
             self.cap.set(cv2.CAP_PROP_BRIGHTNESS, 150)
 
+        # Graustufen-Referenzbild in Boardansicht
+        # wird für Bewegungserkennung genutzt
         self.reference_gray = None
 
+        # Thread- und Frameverwaltung
         self.running = True
         self.frame_lock = threading.Lock()
+
+        # Zuletzt gelesener Frame samt Zeitstempel
         self.latest_frame = None
         self.latest_ts = 0.0
+
+        # Zähler, um neue Frames von bereits konsumierten Frames zu unterscheiden
         self.frame_counter = 0
         self.last_consumed_counter = -1
 
+        # Hintergrundthread startet kontinuierliches Lesen der Kamera
         self.thread = threading.Thread(target=self._reader_loop, daemon=True)
         self.thread.start()
 
     def load_config(self):
+        """
+        Lädt die Kalibrierungspunkte der Kamera aus der JSON-Datei.
+
+        Erwartet wird ein JSON-Objekt mit einem Feld:
+            "points": [[x1, y1], [x2, y2], [x3, y3], [x4, y4]]
+
+        Nur wenn genau 4 Punkte vorliegen, werden sie übernommen.
+        """
         self.src_points = []
+
         if os.path.exists(self.config_file):
             try:
                 with open(self.config_file, "r") as f:
                     data = json.load(f)
+
                 pts = data.get("points", [])
+
                 if isinstance(pts, list) and len(pts) == 4:
                     self.src_points = pts
+
             except Exception:
                 print(f"[ERROR] Config für Cam {self.cam_id} konnte nicht geladen werden.")
 
     def compute_homography(self):
+        """
+        Berechnet die Homographie Kamera -> normierte Boardansicht.
+
+        Die vier gespeicherten Quellpunkte im Kamerabild werden auf ein
+        normiertes 600x600-Board abgebildet.
+
+        Zielpunkte:
+        - Top
+        - Right
+        - Bottom
+        - Left
+
+        Diese liegen auf dem gedachten Double-Ring-Kreis des normierten Boards.
+
+        Falls keine gültigen 4 Quellpunkte vorhanden sind, werden H und invH
+        auf None gesetzt.
+        """
         if len(self.src_points) < 4:
             self.H = None
             self.invH = None
             return
 
+        # Quellpunkte aus der Kamerakalibrierung
         pts1 = np.float32(self.src_points)
 
+        # Ziel-Canvas
         canvas_size = 600
         target_center = canvas_size / 2
+
+        # Nutzungsfaktor: Das Board füllt nur 70% des Bildes
         nutzungs_faktor = 0.70
         dist_double_px = (canvas_size / 2) * nutzungs_faktor
 
+        # Zielpunkte auf den vier Hauptachsen des Dartboards
         top_x = target_center + dist_double_px * 0.156
         top_y = target_center - dist_double_px * 0.987
+
         right_x = target_center + dist_double_px * 0.987
         right_y = target_center + dist_double_px * 0.156
+
         bot_x = target_center - dist_double_px * 0.156
         bot_y = target_center + dist_double_px * 0.987
+
         left_x = target_center - dist_double_px * 0.987
         left_y = target_center - dist_double_px * 0.156
 
+        # Zielpunkte in Boardkoordinaten
         pts2 = np.float32([
             [top_x, top_y],
             [right_x, right_y],
@@ -103,37 +224,77 @@ class CameraHandler:
             [left_x, left_y]
         ])
 
+        # Homographie berechnen
         self.H = cv2.getPerspectiveTransform(pts1, pts2)
+
+        # Inverse Homographie berechnen
         try:
             self.invH = np.linalg.inv(self.H)
         except Exception:
             self.invH = None
 
     def warp_to_board(self, frame_bgr, size=600):
+        """
+        Transformiert ein Kamerabild in die normierte Boardansicht.
+
+        Parameter:
+            frame_bgr:
+                Eingangsbild aus der Kamera
+            size:
+                Zielgröße der quadratischen Boardansicht
+
+        Rückgabe:
+            Gewarpte Boardansicht oder None, falls keine Homographie existiert
+        """
         if self.H is None:
             return None
+
         return cv2.warpPerspective(frame_bgr, self.H, (size, size))
 
     def _reader_loop(self):
+        """
+        Hintergrundthread zum permanenten Einlesen der Kamera.
+
+        Es wird immer nur der neueste Frame gespeichert.
+        Ältere Frames werden implizit verworfen.
+
+        Bei wiederholten Lesefehlern wird kurz pausiert, um CPU zu sparen.
+        """
         fail_count = 0
+
         while self.running:
             try:
                 ret, frame = self.cap.read()
+
                 if ret and frame is not None:
                     with self.frame_lock:
                         self.latest_frame = frame
                         self.latest_ts = time.time()
                         self.frame_counter += 1
+
                     fail_count = 0
                 else:
                     fail_count += 1
                     if fail_count > 20:
                         time.sleep(0.01)
+
             except Exception:
                 fail_count += 1
                 time.sleep(0.01)
 
     def get_latest_frame(self, only_new=False):
+        """
+        Gibt den aktuellsten Frame thread-sicher zurück.
+
+        Parameter:
+            only_new:
+                - False: letzter verfügbarer Frame wird immer geliefert
+                - True: nur wenn seit letztem Abruf ein neuer Frame da ist
+
+        Rückgabe:
+            (frame, timestamp, counter)
+            oder (None, None, None), wenn nichts verfügbar ist
+        """
         with self.frame_lock:
             if self.latest_frame is None:
                 return None, None, None
@@ -144,16 +305,23 @@ class CameraHandler:
             frame = self.latest_frame.copy()
             ts = self.latest_ts
             counter = self.frame_counter
+
             self.last_consumed_counter = counter
+
             return frame, ts, counter
 
     def stop(self):
+        """
+        Stoppt den Kamerathread und gibt die Kameraressourcen frei.
+        """
         self.running = False
+
         try:
             if self.thread.is_alive():
                 self.thread.join(timeout=0.5)
         except Exception:
             pass
+
         try:
             self.cap.release()
         except Exception:
@@ -161,15 +329,57 @@ class CameraHandler:
 
 
 class DartVisionSystem:
+    """
+    Zentrales Vision-System zur Dart-Treffererkennung.
+
+    Hauptaufgaben:
+    - Verwaltung aller Kameras
+    - Board-Normalisierung über Homographien
+    - Bewegungserkennung des Boards
+    - Kandidatenerkennung pro Kamera via AbsDiffDetector
+    - Fusion mehrerer Kameramasken zu einem finalen Trefferpunkt
+    - Entprellung / Cooldown / Candidate-Bestätigung
+    - Referenzbild-Management
+    - Umrechnung Board-Koordinate -> Dart-Score
+    - Debug-Ausgabe
+    """
+
     def __init__(self, hit_callback):
+        """
+        Initialisiert das Vision-System.
+
+        Parameter:
+            hit_callback:
+                Funktion, die bei bestätigtem Treffer mit dem Score-Dictionary
+                aufgerufen wird.
+        """
         self.hit_callback = hit_callback
+
+        # Drei Kameras initialisieren
         self.cameras = [CameraHandler(i) for i in range(3)]
 
+        # ------------------------------------------------------------
+        # Board-Maske
+        # ------------------------------------------------------------
+        # Das normierte Board ist 600x600 Pixel groß.
+        # Die Maske begrenzt den Bereich, in dem Treffer als gültig
+        # betrachtet werden können.
         self.board_mask = np.zeros((600, 600), dtype=np.uint8)
+
+        # Reale Maße:
+        # Double-Außenradius = 170 mm
+        # zusätzlicher Puffer/Nutzungsbereich = 55 mm
         total_radius_mm = 170.0 + 55.0
+
+        # Umrechnung mm -> Pixel, basierend auf 70% Canvas-Nutzung
         self.px_per_mm_calc = (600 * 0.70) / (total_radius_mm * 2)
+
+        # Kreisförmige Maske des gültigen Boardbereichs
         cv2.circle(self.board_mask, (300, 300), int(225 * self.px_per_mm_calc), 255, -1)
 
+        # ------------------------------------------------------------
+        # Ringradien des Dartboards in Pixeln
+        # ------------------------------------------------------------
         self.radii = {
             "bull": 6.35 * self.px_per_mm_calc,
             "single_bull": 15.9 * self.px_per_mm_calc,
@@ -179,124 +389,232 @@ class DartVisionSystem:
             "double_outer": 170.0 * self.px_per_mm_calc
         }
 
+        # ------------------------------------------------------------
+        # Schwellwerte für Boardbewegungs-/Freeze-Erkennung
+        # ------------------------------------------------------------
+        # mean > FREEZE_MEAN und max < FREEZE_MAX
+        # bedeutet: großflächige moderate Veränderung -> eher Bewegung/Wackeln
         self.FREEZE_MEAN = 20
         self.FREEZE_MAX = 70
 
+        # Pro Kamera ein AbsDiff-Detektor
         self.abs_detectors = [
             AbsDiffDetector(self.board_mask, self.FREEZE_MEAN, self.FREEZE_MAX)
             for _ in range(3)
         ]
 
-        # Cam 2 etwas toleranter
+        # Kamera 2 etwas toleranter konfigurieren
+        # z. B. wegen Perspektive, Belichtung oder stärkerem Rauschen
         self.abs_detectors[2].min_area = 120
         self.abs_detectors[2].min_length = 10
         self.abs_detectors[2].max_width = 60.0
         self.abs_detectors[2].min_slenderness = 1.05
         self.abs_detectors[2].min_aspect = 1.0
 
+        # Debug-Ausgabe / Fensterverwaltung
         self.debugger = VisionDebugger(warp_size=800)
 
+        # Hauptloop aktiv?
         self.running = True
+
+        # Konsolen-Debug aktiv?
         self.console_debug = True
 
+        # ------------------------------------------------------------
+        # Letzter bestätigter Treffer
+        # ------------------------------------------------------------
         self.last_hit_time = 0.0
         self.last_hit_board = None
 
+        # ------------------------------------------------------------
+        # Candidate-System:
+        # Treffer wird erst bestätigt, wenn ein ähnlicher Kandidat
+        # kurz darauf erneut erkannt wird.
+        # ------------------------------------------------------------
         self.hit_candidate = None
         self.hit_candidate_time = 0.0
 
+        # Winkelkorrektur für Segmentzuordnung
         self.WINKEL_OFFSET = 0
 
+        # ------------------------------------------------------------
+        # Sperrzeiten
+        # ------------------------------------------------------------
+        # hit_blocked_until:
+        #   harte Sperre, z. B. direkt nach Reset oder Referenzwechsel
         self.hit_blocked_until = time.time() + 0.8
+
+        # hit_cooldown_until:
+        #   kurze Sperre nach bestätigtem Treffer
         self.hit_cooldown_until = 0.0
 
+        # ------------------------------------------------------------
+        # Referenzupdate-Management
+        # ------------------------------------------------------------
         self.pending_reference_update = False
         self.pending_reference_started_at = 0.0
+
+        # Anzahl aufeinanderfolgender stabiler Frames
         self.stable_frames = 0
         self.required_stable_frames = 5
 
+        # ------------------------------------------------------------
+        # Loop-Timing / Verfallszeit von Frames
+        # ------------------------------------------------------------
         self.loop_idle_sleep = 0.0005
         self.max_frame_age_sec = 0.20
 
+        # ------------------------------------------------------------
+        # Debug-Caches gegen Log-Spam
+        # ------------------------------------------------------------
         self.last_candidate_counts = [None, None, None]
         self.last_reject_log = [None, None, None]
         self.last_local_best_label = [None, None, None]
         self.last_fusion_summary = None
 
+        # Maximale Distanz zwischen Masken-/Kandidatenpositionen
+        # verschiedener Kameras, um als gemeinsamer Treffer zu gelten
         self.mask_consensus_max_dist = 20.0
 
     def _dbg(self, msg):
+        """
+        Gibt eine Debugmeldung auf der Konsole aus, wenn aktiviert.
+        """
         if self.console_debug:
             print(msg)
 
     def _block_hits(self, seconds=1.0):
+        """
+        Sperrt Treffererkennung für eine bestimmte Dauer.
+
+        Wird z. B. verwendet:
+        - nach Referenzreset
+        - nach Referenzupdate
+        - in Übergangszuständen
+
+        Parameter:
+            seconds:
+                Dauer der Sperre in Sekunden
+        """
         until = time.time() + seconds
         self.hit_blocked_until = max(self.hit_blocked_until, until)
+
+        # Offenen Kandidaten verwerfen
         self.hit_candidate = None
+
         self._dbg(f"[HIT BLOCK] Treffer gesperrt für {seconds:.2f}s bis {self.hit_blocked_until:.3f}")
 
     def _hits_allowed(self):
+        """
+        Prüft, ob Treffer aktuell überhaupt zugelassen sind.
+
+        Rückgabe:
+            True, wenn weder harte Sperre noch Cooldown aktiv sind
+        """
         now = time.time()
         return now >= self.hit_blocked_until and now >= self.hit_cooldown_until
 
     def run(self):
+        """
+        Hauptloop des Vision-Systems.
+
+        Pro Durchlauf:
+        1. Aktuelle Frames aller Kameras holen
+        2. In Boardkoordinaten transformieren
+        3. Bewegungsstatus prüfen
+        4. Kandidaten und Masken pro Kamera bestimmen
+        5. Falls zulässig: Kamerafusion berechnen
+        6. Treffer bestätigen oder verwerfen
+        7. Debuganzeige aktualisieren
+        8. Referenzupdate bei stabiler Lage durchführen
+        """
         print("[VISION] System bereit...")
+
         try:
+            # Beim Start sofort Referenzen initialisieren
             self.reset_references()
 
             while self.running:
                 now = time.time()
+
+                # Wird True, wenn mindestens eine Kamera Boardbewegung erkennt
                 board_is_moving = False
+
+                # Wird True, wenn im aktuellen Loop mindestens ein
+                # verwertbarer Frame verarbeitet wurde
                 any_frame_processed = False
 
+                # Zwischenspeicher pro Kamera
                 warped_frames = [None, None, None]
                 raw_frames = [None, None, None]
                 gray_warped_frames = [None, None, None]
                 cam_moving = [False, False, False]
 
+                # Ergebnisse pro Kamera
                 mask_results = [None, None, None]
                 mask_list = [None, None, None]
 
+                # --------------------------------------------------------
+                # Frames und Kandidaten pro Kamera verarbeiten
+                # --------------------------------------------------------
                 for idx, cam in enumerate(self.cameras):
                     if cam.H is None:
+                        # Kamera ohne gültige Homographie ist aktuell nicht nutzbar
                         continue
 
+                    # Nur neue Frames verwenden
                     frame, frame_ts, _counter = cam.get_latest_frame(only_new=True)
                     if frame is None:
                         continue
 
+                    # Zu alte Frames verwerfen, um keine stale Daten zu verarbeiten
                     if frame_ts is not None and (now - frame_ts) > self.max_frame_age_sec:
                         continue
 
                     any_frame_processed = True
                     raw_frames[idx] = frame
 
+                    # In normierte Boardansicht transformieren
                     warped = cam.warp_to_board(frame, 600)
                     if warped is None:
                         continue
                     warped_frames[idx] = warped
 
+                    # Graustufenbild für Differenz- und Bewegungsanalyse
                     gray_warped = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
                     gray_warped_frames[idx] = gray_warped
 
+                    # ----------------------------------------------------
+                    # Bewegungsprüfung gegen Referenzbild
+                    # ----------------------------------------------------
                     if cam.reference_gray is not None:
                         diff_motion = cv2.absdiff(gray_warped, cam.reference_gray)
                         mean_val = float(cv2.mean(diff_motion)[0])
                         _, max_val, _, _ = cv2.minMaxLoc(diff_motion)
 
+                        # Interpretation:
+                        # - mean groß: überall leichte Änderung
+                        # - max begrenzt: kein einzelner extremer Punkt
+                        # => eher Boardbewegung/Wackeln statt frischer Dartkontur
                         if mean_val > self.FREEZE_MEAN and max_val < self.FREEZE_MAX:
                             cam_moving[idx] = True
                             board_is_moving = True
 
+                    # ----------------------------------------------------
+                    # Kandidatenmaske per AbsDiff ermitteln
+                    # ----------------------------------------------------
                     result = self.abs_detectors[idx].detect_mask_candidates(warped, gray_warped)
                     mask_results[idx] = result
                     mask_list[idx] = result["mask"]
 
                     cand_count = len(result["candidates"])
+
+                    # Änderungen der Kandidatenzahl loggen
                     if self.last_candidate_counts[idx] != cand_count:
                         self.last_candidate_counts[idx] = cand_count
                         self._dbg(f"[CAM {cam.cam_id}] CANDIDATES abs={cand_count}")
 
+                    # Bei 0 Kandidaten Reject-Statistik loggen
                     if cand_count == 0:
                         reject_key = tuple(sorted(result["reject_stats"].items()))
                         if self.last_reject_log[idx] != reject_key:
@@ -305,11 +623,14 @@ class DartVisionSystem:
                     else:
                         self.last_reject_log[idx] = None
 
+                    # Besten lokalen Kandidaten der Kamera bestimmen
                     local_best = self._pick_best_candidate(result["candidates"], "abs")
                     if local_best is not None:
                         bx, by = local_best["tip_board"]
                         label = self._format_score_label(bx, by)
                         summary = f"{label}@({bx:.1f},{by:.1f})"
+
+                        # Nur Änderungen loggen
                         if self.last_local_best_label[idx] != summary:
                             self.last_local_best_label[idx] = summary
                             self._dbg(
@@ -323,10 +644,14 @@ class DartVisionSystem:
 
                 fused_hit = None
 
+                # Anzahl aktiver Masken mit nichtleerer Fläche
                 active_masks = sum(
                     1 for m in mask_list if m is not None and cv2.countNonZero(m) > 0
                 )
 
+                # --------------------------------------------------------
+                # Fusion nur unter sicheren Bedingungen durchführen
+                # --------------------------------------------------------
                 if (
                     self._hits_allowed()
                     and not board_is_moving
@@ -339,10 +664,13 @@ class DartVisionSystem:
                         max_dist=self.mask_consensus_max_dist
                     )
 
+                    # Nur weiterverarbeiten, wenn es ein Ergebnis gibt
+                    # und der letzte Treffer nicht zu frisch ist
                     if fused_hit is not None and (now - self.last_hit_time > 0.12):
                         final_x, final_y = fused_hit["tip_board"]
                         final_label = self._format_score_label(final_x, final_y)
 
+                        # Kompakte Signatur für Debugvergleich
                         fusion_summary = (
                             round(final_x, 1),
                             round(final_y, 1),
@@ -350,6 +678,7 @@ class DartVisionSystem:
                             tuple(fused_hit["used_cams"]),
                             tuple(round(d, 1) for d in fused_hit["per_cam_dist"]),
                         )
+
                         if self.last_fusion_summary != fusion_summary:
                             self.last_fusion_summary = fusion_summary
                             self._dbg(
@@ -363,6 +692,11 @@ class DartVisionSystem:
 
                         current_point = (int(final_x), int(final_y))
 
+                        # ------------------------------------------------
+                        # Candidate-Logik:
+                        # Erst zwei nahe, zeitnahe Beobachtungen ergeben
+                        # einen bestätigten Treffer.
+                        # ------------------------------------------------
                         if self.hit_candidate is None:
                             self.hit_candidate = current_point
                             self.hit_candidate_time = now
@@ -373,10 +707,13 @@ class DartVisionSystem:
                             )
                             age = now - self.hit_candidate_time
 
+                            # Zweite Beobachtung bestätigt die erste,
+                            # wenn räumlich und zeitlich ausreichend nah.
                             if dist_prev < 18 and age < 0.22:
                                 self.hit_candidate = None
                                 self._emit_score(current_point[0], current_point[1])
                             else:
+                                # Kandidat ersetzen
                                 self.hit_candidate = current_point
                                 self.hit_candidate_time = now
                                 self._dbg(
@@ -384,9 +721,12 @@ class DartVisionSystem:
                                     f"dist_prev={dist_prev:.1f}"
                                 )
 
-                # Debuganzeige:
-                # Wenn Fusion existiert -> denselben finalen Punkt in ALLEN Kameras anzeigen.
-                # Sonst lokaler Fallback.
+                # --------------------------------------------------------
+                # Debuganzeige aktualisieren
+                # --------------------------------------------------------
+                # Bei erfolgreicher Fusion wird derselbe endgültige Punkt
+                # in allen Kamerafenstern dargestellt.
+                # Sonst wird pro Kamera der beste lokale Kandidat angezeigt.
                 for idx, cam in enumerate(self.cameras):
                     frame = raw_frames[idx]
                     if frame is None:
@@ -400,6 +740,8 @@ class DartVisionSystem:
                         bx, by = fused_hit["tip_board"]
                         shown_tip = (bx, by)
                         shown_method = f"fusion | {self._format_score_label(bx, by)}"
+
+                        # Nur für Debuganzeige: Confidence aus Fusionsscore abgeleitet
                         shown_conf = max(1.0, 10000.0 / max(1.0, fused_hit["score"]))
                     else:
                         result = mask_results[idx]
@@ -413,6 +755,8 @@ class DartVisionSystem:
 
                     if shown_tip is not None:
                         bx, by = shown_tip
+
+                        # Für Overlay: Boardpunkt zurück in das Originalbild projizieren
                         tip_full = None
                         if cam.invH is not None:
                             tip_full = pt_transform(cam.invH, (bx, by))
@@ -428,6 +772,7 @@ class DartVisionSystem:
                             conf=shown_conf
                         )
                     else:
+                        # Kamera ohne aktiven Tippunkt darstellen
                         self.debugger.show(
                             cam_id=cam.cam_id,
                             frame_bgr=frame,
@@ -439,20 +784,31 @@ class DartVisionSystem:
                             conf=None
                         )
 
+                # --------------------------------------------------------
+                # Stabilität des Boards überwachen
+                # --------------------------------------------------------
                 if board_is_moving:
+                    # Bewegung löscht offene Kandidaten
                     self.hit_candidate = None
                     self.stable_frames = 0
                 else:
                     self.stable_frames += 1
 
+                # --------------------------------------------------------
+                # Geplantes Referenzupdate nur bei stabiler Lage
+                # --------------------------------------------------------
                 if self.pending_reference_update:
                     enough_stable = self.stable_frames >= self.required_stable_frames
                     min_wait_done = (now - self.pending_reference_started_at) >= 0.05
+
                     if enough_stable and min_wait_done:
                         self.update_references_fast()
                         self.pending_reference_update = False
                         self._dbg("[REFRESH] Referenzen aktualisiert")
 
+                # --------------------------------------------------------
+                # Loop entschärfen / CPU-Last reduzieren
+                # --------------------------------------------------------
                 if not any_frame_processed:
                     time.sleep(0.002)
                 else:
@@ -462,24 +818,50 @@ class DartVisionSystem:
             print(f"[VISION ERROR] {e}")
 
     def stop(self):
+        """
+        Stoppt das gesamte Vision-System sauber.
+
+        Enthält:
+        - Stoppen aller Kameras
+        - Schließen des Debuggers
+        - Schließen aller OpenCV-Fenster
+        """
         self.running = False
+
         for cam in self.cameras:
             try:
                 cam.stop()
             except Exception:
                 pass
+
         try:
             self.debugger.close()
         except Exception:
             pass
+
         try:
             cv2.destroyAllWindows()
         except Exception:
             pass
 
     def reset_references(self):
+        """
+        Setzt alle Referenzbilder vollständig neu.
+
+        Typischer Einsatz:
+        - beim Start
+        - nach Rekalibrierung
+        - nach Reset des Systems
+
+        Ablauf:
+        1. Kurz warten, bis Kameraframes verfügbar sind
+        2. Konfiguration neu laden
+        3. Homographien neu berechnen
+        4. Aktuelle Boardansicht als Referenz speichern
+        """
         self._dbg("[RESET REFERENCES] Starte Neuaufnahme der Referenzen")
 
+        # Kurze Initialwartezeit, damit alle Kameras Frames liefern können
         start = time.time()
         while time.time() - start < 0.3:
             all_ready = True
@@ -493,8 +875,10 @@ class DartVisionSystem:
             time.sleep(0.01)
 
         for idx, cam in enumerate(self.cameras):
+            # Konfiguration und Homographie neu einlesen
             cam.load_config()
             cam.compute_homography()
+
             if cam.H is None:
                 continue
 
@@ -507,9 +891,12 @@ class DartVisionSystem:
                 continue
 
             gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+
+            # Referenz im Detektor und als Graybild ablegen
             self.abs_detectors[idx].set_reference(warped)
             cam.reference_gray = gray
 
+            # Debug-Caches zurücksetzen
             self.last_candidate_counts[idx] = None
             self.last_reject_log[idx] = None
             self.last_local_best_label[idx] = None
@@ -518,9 +905,23 @@ class DartVisionSystem:
 
         self.pending_reference_update = False
         self.stable_frames = 0
+
+        # Nach Reset kurz keine Treffer zulassen
         self._block_hits(0.5)
 
     def update_references_fast(self):
+        """
+        Aktualisiert die Referenzbilder schnell mit den aktuellen Frames.
+
+        Gedacht für den Normalbetrieb nach einem bestätigten Treffer:
+        Sobald das Board wieder stabil ist, wird der neue Zustand
+        inklusive steckendem Dart zur Referenz.
+
+        Unterschied zu reset_references():
+        - kein erneutes Warten auf Kamerastart
+        - keine Neuinitialisierung der Kameras
+        - nur schnelle Übernahme der aktuellen Referenzen
+        """
         for idx, cam in enumerate(self.cameras):
             if cam.H is None:
                 continue
@@ -534,26 +935,49 @@ class DartVisionSystem:
                 continue
 
             gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+
             self.abs_detectors[idx].set_reference(warped)
             cam.reference_gray = gray
 
+            # Debugstatus zurücksetzen
             self.last_candidate_counts[idx] = None
             self.last_reject_log[idx] = None
             self.last_local_best_label[idx] = None
 
         self.stable_frames = 0
+
+        # Sehr kurze Sperre direkt nach dem Referenzwechsel
         self._block_hits(0.10)
 
     def _schedule_reference_update(self):
+        """
+        Plant ein Referenzupdate ein, das später bei stabiler Boardlage
+        ausgeführt werden soll.
+        """
         self.pending_reference_update = True
         self.pending_reference_started_at = time.time()
         self.stable_frames = 0
 
     def _pick_best_candidate(self, objs, source_name, conf_scale=1.0):
+        """
+        Wählt aus einer Kandidatenliste den Eintrag mit der höchsten Confidence.
+
+        Parameter:
+            objs:
+                Liste von Kandidatenobjekten
+            source_name:
+                Name der Quelle, z. B. "abs"
+            conf_scale:
+                Optionaler Multiplikator für die Confidence
+
+        Rückgabe:
+            Vereinheitlichtes Kandidaten-Dictionary oder None
+        """
         if not objs:
             return None
 
         best = max(objs, key=lambda o: float(o.get("confidence", 0.0)))
+
         return {
             "src": source_name,
             "tip_board": best["tip_board"],
@@ -563,6 +987,17 @@ class DartVisionSystem:
         }
 
     def _format_score_label(self, x, y):
+        """
+        Formatiert eine Boardposition als lesbares Score-Label.
+
+        Beispiele:
+            Bull
+            25
+            Double 20
+            Triple 19
+            Single 7
+            Miss
+        """
         s = self._score_from_board(x, y)
 
         if s.get("is_missed", False):
@@ -583,12 +1018,25 @@ class DartVisionSystem:
         return f"Single {sector}"
 
     def _emit_score(self, bx, by):
+        """
+        Meldet einen bestätigten Treffer an das übergeordnete System.
+
+        Schutzmechanismen:
+        - Treffer wird verworfen, wenn er zu nah am letzten Treffer liegt
+        - setzt Cooldown
+        - plant Referenzupdate
+
+        Parameter:
+            bx, by:
+                Trefferpunkt in Boardkoordinaten
+        """
         if self.last_hit_board is not None:
             if np.linalg.norm(np.array((bx, by)) - np.array(self.last_hit_board)) < 18:
                 self._dbg("[EMIT] Verworfen, zu nah am letzten Punkt")
                 return
 
         score_dict = self._score_from_board(bx, by)
+
         self.last_hit_board = (bx, by)
         self.last_hit_time = time.time()
 
@@ -596,16 +1044,45 @@ class DartVisionSystem:
             f"[EMIT] board=({bx:.1f},{by:.1f}) sector={score_dict.get('sector')} ring={score_dict.get('ring', '-')}"
         )
 
+        # Ergebnis an das aufrufende System melden
         self.hit_callback(score_dict)
 
+        # Candidate-System zurücksetzen
         self.hit_candidate = None
+
+        # Kurzer Cooldown nach bestätigtem Treffer
         self.hit_cooldown_until = time.time() + 0.20
+
+        # Referenzupdate später bei stabiler Lage durchführen
         self._schedule_reference_update()
 
     def _score_from_board(self, x, y):
+        """
+        Wandelt eine Boardkoordinate in einen Dart-Score um.
+
+        Vorgehen:
+        1. Abstand zum Mittelpunkt -> Ring bestimmen
+        2. Winkel um den Mittelpunkt -> Sektor bestimmen
+
+        Parameter:
+            x, y:
+                Punkt in normierten Boardkoordinaten
+
+        Rückgabe:
+            Dictionary mit:
+                sector
+                ring
+                is_missed
+                board_x
+                board_y
+        """
+        # Koordinate relativ zum Mittelpunkt
         rel_x, rel_y = x - 300, y - 300
+
+        # Abstand vom Mittelpunkt
         dist = float(np.linalg.norm([rel_x, rel_y]))
 
+        # Außerhalb des Double-Außenrings = Miss
         if dist > float(self.radii["double_outer"]):
             return {
                 "sector": 0,
@@ -614,11 +1091,19 @@ class DartVisionSystem:
                 "board_y": float(y)
             }
 
+        # Winkel im mathematisch sinnvollen System bestimmen
+        # -rel_y, weil Bildkoordinaten nach unten wachsen
         angle = (np.degrees(np.arctan2(-rel_y, rel_x)) + 360 + self.WINKEL_OFFSET) % 360
+
+        # Reihenfolge der Dartsektoren im Uhrzeigersinn
         segments = [6, 13, 4, 18, 1, 20, 5, 12, 9, 14, 11, 8, 16, 7, 19, 3, 17, 2, 15, 10]
+
+        # Sektorindex über 20 Segmente à 18°
         val = segments[int((angle + 9) / 18) % 20]
 
+        # Standard: Single-Feld
         ring = "single"
+
         if dist <= self.radii["bull"]:
             ring = "bull"
         elif dist <= self.radii["single_bull"]:
