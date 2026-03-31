@@ -353,15 +353,14 @@ class MainManager:
         self.screen.blit(status_surf, (960 - status_surf.get_width() // 2, 160))
 
         # --- KALIBRIERUNGS-BUTTON ---
-        # Nur anzeigen, wenn noch nicht alle Kameras kalibriert sind
-        if not is_ready:
-            self.draw_button(
-                "Kameras Kalibrieren",
-                1320, 800, 500, 100,
-                m_pos,
-                "START_CALIBRATION",
-                color=(150, 50, 0)
-            )
+        # Immer anzeigen, damit jederzeit neu kalibriert werden kann
+        self.draw_button(
+            "Kameras Kalibrieren",
+            1320, 800, 500, 100,
+            m_pos,
+            "START_CALIBRATION",
+            color=(150, 50, 0)
+        )
 
         # Spieleranzahl 1 bis 8 als Buttons darstellen
         for i in range(1, 9):
