@@ -41,9 +41,6 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from games.x01 import X01Game
 from games.cricket import CricketGame
 
-# Import des Tastatur-/Wurf-Simulators
-from throw import ThrowSimulator
-
 # Import der Datenbankverwaltung für Spieler, Suchvorschläge usw.
 from database.database import DatabaseManager
 
@@ -71,7 +68,7 @@ class MainManager:
         Hier werden:
         - pygame gestartet
         - Fenster und Fonts erzeugt
-        - Datenbank und Wurf-Simulator initialisiert
+        - Datenbank initialisiert
         - die Kommunikation mit dem Vision-Thread vorbereitet
         - Standardwerte für UI und Spielkonfiguration gesetzt
         """
@@ -95,9 +92,6 @@ class MainManager:
 
         # Datenbankmanager für Spielerverwaltung
         self.db = DatabaseManager()
-
-        # Hilfsklasse, mit der Würfe per Tastatur simuliert werden können
-        self.throw_manager = ThrowSimulator()
 
         # Queue für die Thread-sichere Kommunikation zwischen Kamera/Vision und Hauptlogik
         # Das Vision-System legt Treffer in diese Queue, main.py liest sie aus.
@@ -755,13 +749,6 @@ class MainManager:
                             self.game_instance.confirm_remove()
                         else:
                             self.game_instance.undo_last_throw()
-                    else:
-                        # Sonstige Tasten an den ThrowSimulator geben
-                        res = self.throw_manager.handle_input(ev)
-
-                        # Wenn ein gültiger Wurf zurückkommt und kein Reset-Signal
-                        if res and res != "RESET":
-                            self.game_instance.handle_throw(res[0], res[1])
 
             # --- 3. ZEICHNEN ---
             # Hintergrund löschen
